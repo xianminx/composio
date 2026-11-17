@@ -5,6 +5,7 @@ Base resource class for representing resources in the composio client.
 import contextvars
 from collections.abc import Mapping
 import functools
+import inspect
 import os
 import time
 import traceback
@@ -13,7 +14,7 @@ import typing as t
 from composio_client import AutoAuth, NoAuth, ProjectAuth, Scope, UserAuth
 
 from composio.__version__ import __version__
-from composio.client import HttpClient
+from composio.client import AnyHttpClient, AsyncHttpClient, HttpClient
 from composio.core.models.tool_router_constants import (
     ORG_ID_HEADER,
     PROJECT_ID_HEADER,
@@ -36,6 +37,9 @@ def trace_method(method: t.Callable, name: str) -> t.Callable:
     # Check if the method is a class method
     if getattr(method, "__self__", None) is not None:
         return method
+
+    if inspect.iscoroutinefunction(method):
+        return _trace_async_method(method, name)
 
     @functools.wraps(method)
     def trace_wrapper(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
@@ -79,6 +83,51 @@ def trace_method(method: t.Callable, name: str) -> t.Callable:
     return trace_wrapper
 
 
+def _trace_async_method(method: t.Callable, name: str) -> t.Callable:
+    """:func:`trace_method` for a coroutine function: the event spans the await."""
+
+    @functools.wraps(method)
+    async def trace_wrapper(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+        # The client's own flag first: the context variable is only visible
+        # to tasks started from the one that constructed the SDK.
+        tracking = getattr(self._client, "allow_tracking", None)
+        if not (allow_tracking.get() if tracking is None else tracking):
+            return await method(self, *args, **kwargs)
+
+        start_time = time.time()
+        event: Event = create_event(
+            type="metric",
+            functionName=name,
+            timestamp=time.time(),
+            props={},
+            source={
+                "environment": _environment,  # type: ignore
+                "language": "python",
+                "service": "sdk",
+                "version": __version__,
+            },
+            metadata={
+                "provider": self._client.provider,
+            },
+        )
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as e:
+            _, payload = event
+            payload["error"] = {
+                "name": e.__class__.__name__,
+                "message": redact_sensitive_text(str(e)),
+                "stack": redact_sensitive_text(traceback.format_exc()),
+            }
+            event = ("error", payload)
+            raise e
+        finally:
+            event[1]["durationMs"] = (time.time() - start_time) * 1000
+            push_event(event=event)
+
+    return trace_wrapper
+
+
 class ResourceMeta(type):
     """Meta class for resource classes."""
 
@@ -100,6 +149,17 @@ class Resource(WithLogger, metaclass=ResourceMeta):
         self._client = client
 
 
+class AsyncResource(WithLogger, metaclass=ResourceMeta):
+    """Base resource class for the async composio client."""
+
+    def sanitize_payload(self, payload: PayloadT) -> PayloadT:
+        return {k: v for k, v in payload.items()}  # type: ignore
+
+    def __init__(self, client: AsyncHttpClient):
+        super().__init__()
+        self._client = client
+
+
 def header_value(headers: t.Mapping[str, t.Any], name: str) -> t.Optional[str]:
     """The non-empty value of ``name`` in ``headers``, matched case-insensitively."""
     if not isinstance(headers, Mapping):
@@ -112,7 +172,7 @@ def header_value(headers: t.Mapping[str, t.Any], name: str) -> t.Optional[str]:
     return None
 
 
-def credential_headers(client: HttpClient) -> t.Dict[str, str]:
+def credential_headers(client: AnyHttpClient) -> t.Dict[str, str]:
     """The single credential header the client puts on its own requests.
 
     For the destinations the SDK hands a credential to outside the client (the
@@ -143,7 +203,7 @@ def credential_headers(client: HttpClient) -> t.Dict[str, str]:
     return {}
 
 
-def scope_headers(client: HttpClient) -> t.Dict[str, str]:
+def scope_headers(client: AnyHttpClient) -> t.Dict[str, str]:
     """The ``x-org-id`` / ``x-project-id`` the client sends to its API origin:
     its ``scope``, or without one the caller-placed default headers."""
     scope = client.scope

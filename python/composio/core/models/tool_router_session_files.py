@@ -282,6 +282,87 @@ class RemoteFile:
         )
 
 
+def _normalize_upload_input(
+    input: t.Union[str, Path, bytes, bytearray],
+    *,
+    remote_path: t.Optional[str] = None,
+    mimetype: t.Optional[str] = None,
+) -> t.Tuple[bytes, str, str]:
+    """Normalize upload input to (content, remote_path, mimetype)."""
+    if isinstance(input, (str, Path)):
+        path_str = str(input)
+        if _is_url(path_str):
+            content, mime = _fetch_from_url(path_str)
+            parsed = urlparse(path_str)
+            pathname = unquote(parsed.path)
+            segments = [s for s in pathname.split("/") if s]
+            filename = segments[-1] if segments else ""
+            if not filename or "." not in filename:
+                ext = get_extension_from_mime_type(mime)
+                filename = f"{generate_short_id()}.{ext}"
+            rpath = remote_path or filename
+            return content, rpath, mime
+        # Local file
+        p = Path(path_str)
+        if not p.exists():
+            raise ValidationError(f"File not found: {p}")
+        if not p.is_file():
+            raise ValidationError(f"Not a file: {p}")
+        content = p.read_bytes()
+        mime = mimetype or "application/octet-stream"
+        rpath = remote_path or p.name
+        return content, rpath, mime
+
+    if isinstance(input, (bytes, bytearray)):
+        buffer = bytes(input)
+        if not mimetype and not remote_path:
+            raise ValidationError(
+                "When passing a buffer, either mimetype or remote_path (filename) "
+                "is required. Example: files.upload(buffer, remote_path='data.json', "
+                "mimetype='application/json')"
+            )
+        mime = mimetype or "application/octet-stream"
+        ext = get_extension_from_mime_type(mime)
+        rpath = remote_path or f"upload-{generate_short_id()}.{ext}"
+        return buffer, rpath, mime
+
+    raise ValidationError(
+        f"Unsupported input type: {type(input)}. "
+        "Use str (path/URL), Path, bytes, or bytearray."
+    )
+
+
+def _mount_prefix_arg(path: t.Optional[str]) -> t.Any:
+    """``mount_relative_prefix`` for a ``files.list`` path; root is omitted."""
+    raw_path = path or ""
+    if raw_path in ("", "/"):
+        return omit
+    prefix_str = raw_path[1:] if raw_path.startswith("/") else raw_path
+    return prefix_str if prefix_str else omit
+
+
+def _put_upload(upload_url: str, content: bytes, mime: str) -> None:
+    """Send ``content`` to a presigned upload URL."""
+    # `upload_url` comes from the API response, so it is validated before
+    # the file's bytes are sent to it, and re-validated on every redirect
+    # hop. See `composio.utils.url_safety`.
+    try:
+        upload_resp = safe_request(
+            "PUT",
+            upload_url,
+            data=content,
+            headers={"Content-Type": mime},
+            timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+        )
+    except requests.exceptions.RequestException as e:
+        raise ValidationError(f"Failed to upload file: {type(e).__name__}") from e
+
+    if not upload_resp.ok:
+        raise ValidationError(
+            f"Failed to upload file: {upload_resp.status_code} {upload_resp.reason}"
+        )
+
+
 class ToolRouterSessionFilesMount:
     """File mount for a tool router session - list, upload, download, delete."""
 
@@ -308,17 +389,10 @@ class ToolRouterSessionFilesMount:
         Returns:
             FileListResponse with items and next_cursor.
         """
-        raw_path = path or ""
-        if raw_path in ("", "/"):
-            mount_relative_prefix_arg: t.Any = omit
-        else:
-            prefix_str = raw_path[1:] if raw_path.startswith("/") else raw_path
-            mount_relative_prefix_arg = prefix_str if prefix_str else omit
-
         return self._client.tool_router.session.files.list(
             mount_id,
             session_id=self._session_id,
-            mount_relative_prefix=mount_relative_prefix_arg,
+            mount_relative_prefix=_mount_prefix_arg(path),
             cursor=cursor if cursor else omit,
             limit=int(limit) if limit is not None else omit,
         )
@@ -331,46 +405,8 @@ class ToolRouterSessionFilesMount:
         mimetype: t.Optional[str] = None,
     ) -> t.Tuple[bytes, str, str]:
         """Normalize upload input to (content, remote_path, mimetype)."""
-        if isinstance(input, (str, Path)):
-            path_str = str(input)
-            if _is_url(path_str):
-                content, mime = _fetch_from_url(path_str)
-                parsed = urlparse(path_str)
-                pathname = unquote(parsed.path)
-                segments = [s for s in pathname.split("/") if s]
-                filename = segments[-1] if segments else ""
-                if not filename or "." not in filename:
-                    ext = get_extension_from_mime_type(mime)
-                    filename = f"{generate_short_id()}.{ext}"
-                rpath = remote_path or filename
-                return content, rpath, mime
-            # Local file
-            p = Path(path_str)
-            if not p.exists():
-                raise ValidationError(f"File not found: {p}")
-            if not p.is_file():
-                raise ValidationError(f"Not a file: {p}")
-            content = p.read_bytes()
-            mime = mimetype or "application/octet-stream"
-            rpath = remote_path or p.name
-            return content, rpath, mime
-
-        if isinstance(input, (bytes, bytearray)):
-            buffer = bytes(input)
-            if not mimetype and not remote_path:
-                raise ValidationError(
-                    "When passing a buffer, either mimetype or remote_path (filename) "
-                    "is required. Example: files.upload(buffer, remote_path='data.json', "
-                    "mimetype='application/json')"
-                )
-            mime = mimetype or "application/octet-stream"
-            ext = get_extension_from_mime_type(mime)
-            rpath = remote_path or f"upload-{generate_short_id()}.{ext}"
-            return buffer, rpath, mime
-
-        raise ValidationError(
-            f"Unsupported input type: {type(input)}. "
-            "Use str (path/URL), Path, bytes, or bytearray."
+        return _normalize_upload_input(
+            input, remote_path=remote_path, mimetype=mimetype
         )
 
     def upload(
@@ -395,24 +431,7 @@ class ToolRouterSessionFilesMount:
             mimetype=mime,
         )
 
-        # `upload_url` comes from the API response, so it is validated before
-        # the file's bytes are sent to it, and re-validated on every redirect
-        # hop. See `composio.utils.url_safety`.
-        try:
-            upload_resp = safe_request(
-                "PUT",
-                create_resp.upload_url,
-                data=content,
-                headers={"Content-Type": mime},
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-            )
-        except requests.exceptions.RequestException as e:
-            raise ValidationError(f"Failed to upload file: {type(e).__name__}") from e
-
-        if not upload_resp.ok:
-            raise ValidationError(
-                f"Failed to upload file: {upload_resp.status_code} {upload_resp.reason}"
-            )
+        _put_upload(create_resp.upload_url, content, mime)
 
         download_resp = self._client.tool_router.session.files.create_download_url(
             mount_id,

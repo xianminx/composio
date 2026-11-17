@@ -326,84 +326,10 @@ ExperimentalCustomToolkits = CustomToolkits
 """Deprecated alias of :class:`CustomToolkits`."""
 
 
-class ExperimentalAPI:
-    """Experimental APIs accessed via ``composio.experimental``.
-
-    Provides decorators for creating custom tools and toolkits that run
-    in-process alongside remote Composio tools, plus experimental SDK
-    methods whose shape may change in future releases.
-    """
+class _ExperimentalDecorators:
+    """The client-free part of the namespace: local tool and toolkit builders."""
 
     Toolkit = ExperimentalToolkit
-
-    usage: ExperimentalUsage
-    """Project usage metering. Experimental — shape may change."""
-
-    custom_toolkits: CustomToolkits
-    """Deprecated: use ``composio.custom_toolkits``, the same object."""
-
-    def __init__(self, client: t.Optional[HttpClient] = None) -> None:
-        self._client = client
-        self.usage = ExperimentalUsage(client=client)
-        self.custom_toolkits = CustomToolkits(client=client)
-
-    def update_acl(
-        self,
-        nanoid: str,
-        *,
-        allow_all_users: t.Optional[bool] = None,
-        allowed_user_ids: t.Optional[t.List[str]] = None,
-        not_allowed_user_ids: t.Optional[t.List[str]] = None,
-    ) -> connected_account_patch_response.ConnectedAccountPatchResponse:
-        """
-        Update the per-user ACL on a SHARED connected account. Experimental —
-        shape may change in future releases.
-
-        Only valid on SHARED connections; raises
-        ``ComposioAclOnlyForSharedError`` on a PRIVATE connection. Omit a
-        parameter to leave it unchanged; pass an empty list to clear an
-        allow/deny list. At least one parameter must be provided.
-
-        :param nanoid: The connected account ID (``ca_xxx``).
-        :param allow_all_users: When True, any ``user_id`` may use this
-            SHARED connection (subject to the deny list).
-        :param allowed_user_ids: Explicit list of allowed ``user_id`` strings.
-            Pass ``[]`` to clear.
-        :param not_allowed_user_ids: Explicit deny list (wins over allow on
-            conflict). Pass ``[]`` to clear — note that clearing the deny
-            list silently re-grants access to previously-blocked users.
-        :return: Response with ``id``, ``status``, and ``success``.
-
-        .. deprecated::
-            Use :meth:`composio.connected_accounts.update_acl` instead — ACL
-            updates graduated onto the ``connected_accounts`` model. This
-            experimental alias is kept only for backwards compatibility and
-            delegates to it. Prefer the ``connected_accounts`` model; do not
-            generate new code against this alias.
-
-        Example:
-            composio.connected_accounts.update_acl(
-                'ca_abc',
-                allow_all_users=True,
-                not_allowed_user_ids=['user_bob'],
-            )
-        """
-        from composio import exceptions
-
-        from .connected_accounts import ConnectedAccounts
-
-        if self._client is None:
-            raise exceptions.ValidationError(
-                "update_acl requires a Composio client. Access it via "
-                "composio.connected_accounts.update_acl(...)."
-            )
-
-        return ConnectedAccounts(client=self._client).update_acl(
-            nanoid,
-            allow_all_users=allow_all_users,
-            allowed_user_ids=allowed_user_ids,
-            not_allowed_user_ids=not_allowed_user_ids,
-        )
 
     @t.overload
     def tool(self, fn: t.Callable[..., t.Any], /) -> CustomTool: ...
@@ -482,3 +408,81 @@ class ExperimentalAPI:
                 annotation_locals=_get_caller_locals(),
             )
         return decorator
+
+
+class ExperimentalAPI(_ExperimentalDecorators):
+    """Experimental APIs accessed via ``composio.experimental``.
+
+    Provides decorators for creating custom tools and toolkits that run
+    in-process alongside remote Composio tools, plus experimental SDK
+    methods whose shape may change in future releases.
+    """
+
+    usage: ExperimentalUsage
+    """Project usage metering. Experimental — shape may change."""
+
+    custom_toolkits: CustomToolkits
+    """Deprecated: use ``composio.custom_toolkits``, the same object."""
+
+    def __init__(self, client: t.Optional[HttpClient] = None) -> None:
+        self._client = client
+        self.usage = ExperimentalUsage(client=client)
+        self.custom_toolkits = CustomToolkits(client=client)
+
+    def update_acl(
+        self,
+        nanoid: str,
+        *,
+        allow_all_users: t.Optional[bool] = None,
+        allowed_user_ids: t.Optional[t.List[str]] = None,
+        not_allowed_user_ids: t.Optional[t.List[str]] = None,
+    ) -> connected_account_patch_response.ConnectedAccountPatchResponse:
+        """
+        Update the per-user ACL on a SHARED connected account. Experimental —
+        shape may change in future releases.
+
+        Only valid on SHARED connections; raises
+        ``ComposioAclOnlyForSharedError`` on a PRIVATE connection. Omit a
+        parameter to leave it unchanged; pass an empty list to clear an
+        allow/deny list. At least one parameter must be provided.
+
+        :param nanoid: The connected account ID (``ca_xxx``).
+        :param allow_all_users: When True, any ``user_id`` may use this
+            SHARED connection (subject to the deny list).
+        :param allowed_user_ids: Explicit list of allowed ``user_id`` strings.
+            Pass ``[]`` to clear.
+        :param not_allowed_user_ids: Explicit deny list (wins over allow on
+            conflict). Pass ``[]`` to clear — note that clearing the deny
+            list silently re-grants access to previously-blocked users.
+        :return: Response with ``id``, ``status``, and ``success``.
+
+        .. deprecated::
+            Use :meth:`composio.connected_accounts.update_acl` instead — ACL
+            updates graduated onto the ``connected_accounts`` model. This
+            experimental alias is kept only for backwards compatibility and
+            delegates to it. Prefer the ``connected_accounts`` model; do not
+            generate new code against this alias.
+
+        Example:
+            composio.connected_accounts.update_acl(
+                'ca_abc',
+                allow_all_users=True,
+                not_allowed_user_ids=['user_bob'],
+            )
+        """
+        from composio import exceptions
+
+        from .connected_accounts import ConnectedAccounts
+
+        if self._client is None:
+            raise exceptions.ValidationError(
+                "update_acl requires a Composio client. Access it via "
+                "composio.connected_accounts.update_acl(...)."
+            )
+
+        return ConnectedAccounts(client=self._client).update_acl(
+            nanoid,
+            allow_all_users=allow_all_users,
+            allowed_user_ids=allowed_user_ids,
+            not_allowed_user_ids=not_allowed_user_ids,
+        )

@@ -109,6 +109,40 @@ def _custom_headers() -> t.Optional[t.Dict[str, str]]:
     return parsed or None
 
 
+def _resolve_auth(kwargs: t.Mapping[str, t.Any]) -> t.Tuple[Auth, t.Optional[Scope]]:
+    """The client ``auth`` and ``scope`` for the SDK keyword arguments."""
+    disable_api_key = kwargs.get("disable_api_key", False)
+    user_api_key = kwargs.get("user_api_key") or _env_key("COMPOSIO_USER_API_KEY")
+    org_api_key = kwargs.get("org_api_key") or _env_key("COMPOSIO_ORG_API_KEY")
+    auth: Auth
+    if disable_api_key:
+        if kwargs.get("api_key") is not None:
+            raise exceptions.InvalidParams(
+                "`disable_api_key=True` cannot be combined with an explicit "
+                "`api_key`; pass one or the other"
+            )
+        if not user_api_key:
+            raise exceptions.UserApiKeyNotProvidedError()
+        # The user key alone, on every request. An organization key is
+        # not sent in this mode, as before.
+        auth = UserAuth(user_api_key)
+    else:
+        api_key = kwargs.get("api_key", os.environ.get("COMPOSIO_API_KEY"))
+        if not api_key:
+            raise exceptions.ApiKeyNotProvidedError()
+        # With a user or organization key beside it, the client sends
+        # exactly one credential per request: the project key wherever the
+        # operation accepts it, otherwise the first declared scheme a key is
+        # held for. With the project key alone, that key on every request.
+        auth = (
+            AutoAuth(project=api_key, user=user_api_key, organization=org_api_key)
+            if user_api_key or org_api_key
+            else ProjectAuth(api_key)
+        )
+    scope = _scope(org_id=kwargs.get("org_id"), project_id=kwargs.get("project_id"))
+    return auth, scope
+
+
 class Composio(t.Generic[TTool, TToolCollection], WithLogger):
     """
     Composio SDK for Python.
@@ -238,35 +272,7 @@ class Composio(t.Generic[TTool, TToolCollection], WithLogger):
         logger = kwargs.get("logger")
         logging_level = kwargs.get("logging_level")
         WithLogger.__init__(self, logger=logger, logging_level=logging_level)
-        disable_api_key = kwargs.get("disable_api_key", False)
-        user_api_key = kwargs.get("user_api_key") or _env_key("COMPOSIO_USER_API_KEY")
-        org_api_key = kwargs.get("org_api_key") or _env_key("COMPOSIO_ORG_API_KEY")
-        auth: Auth
-        if disable_api_key:
-            if kwargs.get("api_key") is not None:
-                raise exceptions.InvalidParams(
-                    "`disable_api_key=True` cannot be combined with an explicit "
-                    "`api_key`; pass one or the other"
-                )
-            if not user_api_key:
-                raise exceptions.UserApiKeyNotProvidedError()
-            # The user key alone, on every request. An organization key is
-            # not sent in this mode, as before.
-            auth = UserAuth(user_api_key)
-        else:
-            api_key = kwargs.get("api_key", os.environ.get("COMPOSIO_API_KEY"))
-            if not api_key:
-                raise exceptions.ApiKeyNotProvidedError()
-            # With a user or organization key beside it, the client sends
-            # exactly one credential per request: the project key wherever the
-            # operation accepts it, otherwise the first declared scheme a key is
-            # held for. With the project key alone, that key on every request.
-            auth = (
-                AutoAuth(project=api_key, user=user_api_key, organization=org_api_key)
-                if user_api_key or org_api_key
-                else ProjectAuth(api_key)
-            )
-        scope = _scope(org_id=kwargs.get("org_id"), project_id=kwargs.get("project_id"))
+        auth, scope = _resolve_auth(kwargs)
 
         # Each instance gets its own provider so that the execute_tool_fn binding
         # performed by Tools.__init__ cannot leak across SDK instances (issue #4369).

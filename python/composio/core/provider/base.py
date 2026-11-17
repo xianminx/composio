@@ -37,6 +37,19 @@ class ExecuteToolFn(t.Protocol):
         ...
 
 
+class AsyncExecuteToolFn(t.Protocol):
+    """:class:`ExecuteToolFn` as a coroutine function, set by ``AsyncComposio``."""
+
+    def __call__(
+        self,
+        slug: str,
+        arguments: t.Dict,
+        *,
+        modifiers: t.Optional[Modifiers] = None,
+        user_id: t.Optional[str] = None,
+    ) -> t.Awaitable[ToolExecutionResponse]: ...
+
+
 class ToolCallSession(t.Protocol):
     """Execution contract implemented by ToolRouterSession."""
 
@@ -48,7 +61,19 @@ class ToolCallSession(t.Protocol):
     ) -> t.Any: ...
 
 
+class AsyncToolCallSession(t.Protocol):
+    """Execution contract implemented by AsyncToolRouterSession."""
+
+    def execute(
+        self,
+        tool_slug: str,
+        *,
+        arguments: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> t.Awaitable[t.Any]: ...
+
+
 ToolCallExecutionTarget: t.TypeAlias = t.Union[str, ToolCallSession]
+AsyncToolCallExecutionTarget: t.TypeAlias = t.Union[str, AsyncToolCallSession]
 
 
 class SchemaConfig(te.TypedDict):
@@ -78,6 +103,12 @@ class BaseProvider(t.Generic[TTool, TToolCollection]):
     This is automatically injected by the core SDK.
     """
 
+    aexecute_tool: AsyncExecuteToolFn
+    """
+    The coroutine counterpart of ``execute_tool``, for the ``a``-prefixed helper
+    methods. Injected by ``AsyncComposio``; unset under the sync ``Composio``.
+    """
+
     def __init__(self, **kwargs: te.Unpack[BaseProviderConfig]) -> None:
         self.skip_default = kwargs.get("schema_config", {}).get(
             "skip_defaults", self.__schema_skip_defaults__
@@ -86,12 +117,31 @@ class BaseProvider(t.Generic[TTool, TToolCollection]):
     def set_execute_tool_fn(self, execute_tool_fn: ExecuteToolFn) -> None:
         self.execute_tool = execute_tool_fn
 
+    def set_async_execute_tool_fn(self, execute_tool_fn: AsyncExecuteToolFn) -> None:
+        self.aexecute_tool = execute_tool_fn
+
+    @t.overload
     def resolve_tool_call_execution_target(
         self,
         *,
         user_id: t.Optional[str],
         session: t.Optional[ToolCallSession],
-    ) -> ToolCallExecutionTarget:
+    ) -> ToolCallExecutionTarget: ...
+
+    @t.overload
+    def resolve_tool_call_execution_target(
+        self,
+        *,
+        user_id: t.Optional[str],
+        session: t.Optional[AsyncToolCallSession],
+    ) -> AsyncToolCallExecutionTarget: ...
+
+    def resolve_tool_call_execution_target(
+        self,
+        *,
+        user_id: t.Optional[str],
+        session: t.Optional[t.Any],
+    ) -> t.Any:
         """Resolve exactly one direct user or Tool Router session target."""
         if (user_id is None) == (session is None):
             raise ValueError("Provide exactly one of user_id or session")
@@ -125,4 +175,29 @@ class BaseProvider(t.Generic[TTool, TToolCollection]):
         from composio.core.models.tools import tool_execution_response_from_session
 
         result = target.execute(tool_slug=slug, arguments=arguments)
+        return tool_execution_response_from_session(result)
+
+    async def aexecute_tool_for_target(
+        self,
+        *,
+        target: AsyncToolCallExecutionTarget,
+        slug: str,
+        arguments: t.Dict[str, t.Any],
+        modifiers: t.Optional[Modifiers] = None,
+    ) -> ToolExecutionResponse:
+        """See :meth:`execute_tool_for_target`."""
+        if isinstance(target, str):
+            return await self.aexecute_tool(
+                slug=slug,
+                arguments=arguments,
+                modifiers=modifiers,
+                user_id=target,
+            )
+        if modifiers is not None:
+            raise ValueError(
+                "Direct execution modifiers cannot be used with a Tool Router session"
+            )
+        from composio.core.models.tools import tool_execution_response_from_session
+
+        result = await target.execute(tool_slug=slug, arguments=arguments)
         return tool_execution_response_from_session(result)

@@ -26,7 +26,7 @@ from composio import exceptions
 from composio.client import HttpClient
 from composio.client.types import trigger_instance_upsert_response
 from composio.core.models.base import Resource, credential_headers
-from composio.core.models.internal import Internal
+from composio.core.models.internal import Internal, SDKRealtimeCredentialsResponse
 from composio.core.models.webhooks import (
     DEFAULT_WEBHOOK_SUBSCRIPTION_EVENTS,
     WebhookSubscription,
@@ -789,8 +789,8 @@ class TriggerSubscription(Resource):
                 f"with error:\n {traceback.format_exc()}"
             )
 
-    def _handle_event(self, event: str) -> None:
-        """Filter events and call the callback function."""
+    def _parse_event(self, event: str) -> t.Optional[TriggerEvent]:
+        """Parse a frame for dispatch, logging the outcome."""
         data = self._parse_payload(event=event)
         if data is None:
             # _parse_payload already logged the specific reason; here we only
@@ -799,12 +799,20 @@ class TriggerSubscription(Resource):
             self.logger.error(
                 f"Skipping unparseable trigger frame: {_truncate_frame(event)}"
             )
-            return
+            return None
 
         self.logger.debug(
             f"Received trigger event with trigger ID: {data['metadata']['id']} "
             f"and trigger name: {data['metadata']['trigger_slug']}"
         )
+        return data
+
+    def _handle_event(self, event: str) -> None:
+        """Filter events and call the callback function."""
+        data = self._parse_event(event)
+        if data is None:
+            return
+
         awaitables: t.List = []
         with ThreadPoolExecutor() as executor:
             for callback, filters in self._callbacks:
@@ -830,11 +838,17 @@ class TriggerSubscription(Resource):
         """
         self.logger.error(f"Trigger subscription error: {error}")
         self._connection_error = error
+        if self._on_subscription_error is None:
+            return
+        self._notify_subscription_error({"error": str(error)})
+
+    def _notify_subscription_error(self, payload: t.Dict[str, t.Any]) -> None:
+        """Invoke the ``on_subscription_error`` callback, containing its errors."""
         callback = self._on_subscription_error
         if callback is None:
             return
         try:
-            callback({"error": str(error)})
+            callback(payload)
         except Exception:
             self.logger.error(
                 f"Error in subscription error callback:\n {traceback.format_exc()}"
@@ -856,19 +870,13 @@ class TriggerSubscription(Resource):
         (pysher invokes bound callbacks without a try/except).
         """
         self.logger.error(f"Trigger subscription error: {_truncate_frame(event)}")
-        callback = self._on_subscription_error
-        if callback is None:
+        if self._on_subscription_error is None:
             return
         try:
             payload: t.Dict[str, t.Any] = json.loads(event)
         except Exception:
             payload = {"raw": event}
-        try:
-            callback(payload)
-        except Exception:
-            self.logger.error(
-                f"Error in subscription error callback:\n {traceback.format_exc()}"
-            )
+        self._notify_subscription_error(payload)
 
     def is_alive(self) -> bool:
         """Check if subscription is live."""
@@ -1082,11 +1090,12 @@ class _SubcriptionBuilder(WithLogger):
                 event_name="pusher:subscription_error",
                 callback=subscription._handle_subscription_error,
             )
-            subscription.set_alive()
             subscription._channel = channel  # pylint: disable=protected-access
             subscription._connection = (  # pylint: disable=protected-access
                 channel.connection
             )
+            # Last: `connect()` returns the subscription once it is alive.
+            subscription.set_alive()
 
         return _connection_handler
 
@@ -1110,29 +1119,10 @@ class _SubcriptionBuilder(WithLogger):
     ) -> TriggerSubscription:
         """Connect to Pusher channel for given client ID."""
         self.logger.debug("Creating trigger subscription")
-        project_info = self.internal.get_sdk_realtime_credentials()
-        pusher = self._get_pusher_instance(
-            key=project_info.pusher_key,
-            cluster=project_info.pusher_cluster,
+        pusher = self._start(
+            self.internal.get_sdk_realtime_credentials(),
+            on_subscription_error,
         )
-
-        # pysher logs every raw frame at INFO; keep them out of user logs.
-        pusher.connection.logger = _silent_pysher_logger()
-        pusher.connection.bind(
-            "pusher:connection_established",
-            self._get_connection_handler(
-                project_id=project_info.project_id,
-                pusher=pusher,
-                subscription=self.subscription,
-            ),
-        )
-        # Set before ``pusher.connect()``: the subscription_error handler runs
-        # on pysher's websocket thread once the channel subscribes, so the
-        # callback must already be in place.
-        self.subscription._on_subscription_error = (  # pylint: disable=protected-access
-            on_subscription_error
-        )
-        pusher.connect()
 
         # Wait for connection to get established. On timeout, tear down the
         # connection before raising: pysher's run loop reconnects every
@@ -1156,242 +1146,41 @@ class _SubcriptionBuilder(WithLogger):
             pusher.disconnect()
             raise
 
-
-class Triggers(Resource):
-    """Triggers (instance) class"""
-
-    enable: t.Callable
-    """Enables a trigger given its id"""
-
-    disable: t.Callable
-    """Disables a trigger given its id"""
-
-    def __init__(
+    def _start(
         self,
-        client: HttpClient,
-        toolkit_versions: t.Optional[ToolkitVersionParam] = None,
-    ):
-        """
-        Initialize the triggers resource.
-
-        :param client: The client to use for the triggers resource.
-        :param toolkit_versions: The versions of the toolkits to use. Defaults to 'latest' if not provided.
-        """
-        self._client = client
-        self._toolkit_versions = toolkit_versions
-        self.list_enum = self._client.triggers_types.retrieve_enum
-        self.delete = self._client.trigger_instances.manage.delete
-        self.enable = functools.partial(
-            self._client.trigger_instances.manage.update,
-            status="enable",
-        )
-        self.disable = functools.partial(
-            self._client.trigger_instances.manage.update,
-            status="disable",
+        project_info: SDKRealtimeCredentialsResponse,
+        on_subscription_error: t.Optional[SubscriptionErrorCallback],
+    ) -> Pusher:
+        """Build the pusher client, wire the subscription to it and start
+        connecting. Returns without waiting for the connection."""
+        pusher = self._get_pusher_instance(
+            key=project_info.pusher_key,
+            cluster=project_info.pusher_cluster,
         )
 
-    def set_webhook_subscription(
-        self,
-        *,
-        webhook_url: str,
-        enabled_events: t.Optional[t.Sequence[str]] = None,
-        version: t.Union[WebhookVersion, str] = WebhookVersion.V3,
-    ) -> WebhookSubscription:
-        """
-        Create or update the project webhook subscription used for webhook delivery.
-
-        If a subscription already exists, the first subscription is updated. Otherwise a
-        new subscription is created. By default this subscribes to V3 trigger message
-        events.
-
-        Example:
-            composio.triggers.set_webhook_subscription(
-                webhook_url=f"{APP_URL}/webhooks/composio",
-            )
-        """
-        return WebhookSubscriptions(client=self._client).set(
-            webhook_url=webhook_url,
-            enabled_events=enabled_events,
-            version=version,
+        # pysher logs every raw frame at INFO; keep them out of user logs.
+        pusher.connection.logger = _silent_pysher_logger()
+        pusher.connection.bind(
+            "pusher:connection_established",
+            self._get_connection_handler(
+                project_id=project_info.project_id,
+                pusher=pusher,
+                subscription=self.subscription,
+            ),
         )
-
-    def get_type(self, slug: str) -> TriggersTypeRetrieveResponse:
-        """
-        Get a trigger type by its slug
-        Uses the global toolkit version provided when initializing composio instance to fetch trigger for specific toolkit version
-
-        :param slug: The slug of the trigger type
-        :return: The trigger type
-        """
-        return self._client.triggers_types.retrieve(
-            slug=slug, toolkit_versions=none_to_omit(self._toolkit_versions)
+        # Set before ``pusher.connect()``: the subscription_error handler runs
+        # on pysher's websocket thread once the channel subscribes, so the
+        # callback must already be in place.
+        self.subscription._on_subscription_error = (  # pylint: disable=protected-access
+            on_subscription_error
         )
+        pusher.connect()
+        return pusher
 
-    def list_active(
-        self,
-        trigger_ids: t.Optional[list[str]] = None,
-        trigger_names: t.Optional[list[str]] = None,
-        auth_config_ids: t.Optional[list[str]] = None,
-        connected_account_ids: t.Optional[list[str]] = None,
-        show_disabled: t.Optional[bool] = None,
-        limit: t.Optional[int] = None,
-        cursor: t.Optional[str] = None,
-    ):
-        """
-        List all active triggers
 
-        :param trigger_ids: List of trigger IDs to filter by
-        :param trigger_names: List of trigger names to filter by
-        :param auth_config_ids: List of auth config IDs to filter by
-        :param connected_account_ids: List of connected account IDs to filter by
-        :param show_disabled: Whether to show disabled triggers
-        :param limit: Limit the number of triggers to return
-        :param cursor: Cursor for pagination. Use the nextCursor from the response to get the next page.
-        :return: List of active triggers
-        """
-        return self._client.trigger_instances.list_active(
-            query_trigger_ids_1=trigger_ids,
-            query_trigger_names_1=trigger_names,
-            query_auth_config_ids_1=auth_config_ids,
-            query_connected_account_ids_1=connected_account_ids,
-            query_show_disabled_1=show_disabled,
-            limit=limit if limit is not None else omit,
-            cursor=cursor if cursor is not None else omit,
-        )
-
-    def list(
-        self,
-        *,
-        cursor: t.Optional[str] = None,
-        limit: t.Optional[int] = None,
-        toolkit_slugs: t.Optional[list[str]] = None,
-    ):
-        """
-        List all the trigger types.
-
-        :param cursor: The cursor for pagination
-        :param limit: The maximum number of trigger types to return
-        :param toolkit_slugs: Filter by toolkit slugs
-        :return: The list of trigger types
-        """
-        return self._client.triggers_types.list(
-            cursor=none_to_omit(cursor),
-            limit=none_to_omit(limit),
-            toolkit_slugs=none_to_omit(toolkit_slugs),
-            toolkit_versions=none_to_omit(self._toolkit_versions),
-        )
-
-    @t.overload
-    def create(
-        self,
-        slug: str,
-        *,
-        connected_account_id: str,
-        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
-        type: t.Optional[t.Literal["webhook", "poll"]] = None,
-        polling_interval: t.Optional[int] = None,
-    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse: ...
-
-    @t.overload
-    def create(
-        self,
-        slug: str,
-        *,
-        user_id: str,
-        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
-        type: t.Optional[t.Literal["webhook", "poll"]] = None,
-        polling_interval: t.Optional[int] = None,
-    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse: ...
-
-    def create(
-        self,
-        slug: str,
-        *,
-        user_id: t.Optional[str] = None,
-        connected_account_id: t.Optional[str] = None,
-        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
-        type: t.Optional[t.Literal["webhook", "poll"]] = None,
-        polling_interval: t.Optional[int] = None,
-    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse:
-        """
-        Create a trigger instance
-
-        :param slug: The slug of the trigger
-        :param user_id: The ID of the user that owns the connected account. When
-            ``connected_account_id`` is omitted, the backend resolves the first
-            active connection for this user and the trigger's toolkit.
-        :param connected_account_id: The ID of the connected account to pin
-        :param trigger_config: The configuration of the trigger
-        :param type: ``webhook`` or ``poll``, for a trigger that supports both.
-            Omit it to let Composio choose.
-        :param polling_interval: Minutes between polls, for an instance that polls.
-            Wins over ``trigger_config["interval"]``.
-        :return: The trigger instance, with the ``type`` it uses, the
-            ``fallback_reason`` when it polls after a webhook was unavailable, and
-            its ``polling_interval``
-        """
-        # Treat blank strings as missing so an empty or whitespace-only
-        # `user_id` / `connected_account_id` does not slip past the guard below
-        # or reach the backend (parity with the TypeScript SDK's `userId` check).
-        if isinstance(user_id, str) and not user_id.strip():
-            user_id = None
-        if isinstance(connected_account_id, str) and not connected_account_id.strip():
-            connected_account_id = None
-
-        if user_id is None and connected_account_id is None:
-            raise exceptions.InvalidParams(
-                "please provide valid `connected_account_id` or `user_id`"
-            )
-
-        # Validate the trigger slug up-front so callers get a clear
-        # `TriggerTypeNotFound` (parity with the TypeScript SDK).
-        try:
-            self.get_type(slug=slug)
-        except APIStatusError as error:
-            if error.status_code in (400, 404):
-                raise exceptions.TriggerTypeNotFound(
-                    f"Trigger type {slug} not found"
-                ) from error
-            raise
-
-        # Pass user_id straight through: when connected_account_id is omitted the
-        # backend resolves the first active connection for this user and the
-        # trigger's toolkit (parity with tool execution). When 2FA is enabled and
-        # connected_account_id is pinned, the backend validates that user_id owns it.
-        return self._client.trigger_instances.upsert(
-            slug=slug,
-            connected_account_id=none_to_omit(connected_account_id),
-            toolkit_versions=self._toolkit_versions,
-            body_trigger_config_1=none_to_omit(trigger_config),
-            type=none_to_omit(type),
-            polling_interval=none_to_omit(polling_interval),
-            user_id=none_to_omit(user_id),
-        )
-
-    def subscribe(
-        self,
-        timeout: float = 15.0,
-        on_subscription_error: t.Optional[SubscriptionErrorCallback] = None,
-    ) -> TriggerSubscription:
-        """
-        Subscribe to a trigger and receive trigger events.
-
-        :param timeout: The timeout to wait for the subscription to be established.
-        :param on_subscription_error: Optional callback invoked when the channel
-            subscription fails: with the raw Pusher payload for asynchronous
-            ``pusher:subscription_error`` events (for example a later permission
-            rejection), or with ``{"error": ...}`` for failures raised while
-            establishing the subscription (for example an auth rejection —
-            pysher performs channel auth synchronously). Establish-time failures
-            also make ``subscribe()`` raise the underlying error promptly
-            instead of waiting out the timeout. Exceptions raised inside the
-            callback are contained and logged, never rethrown.
-        :return: The trigger subscription handler.
-        """
-        return _SubcriptionBuilder(client=self._client).connect(
-            timeout=timeout,
-            on_subscription_error=on_subscription_error,
-        )
+class _WebhookVerification:
+    """Webhook verification and parsing, shared by ``Triggers`` and
+    ``AsyncTriggers``. None of it does IO."""
 
     def verify_webhook(
         self,
@@ -1903,4 +1692,246 @@ class Triggers(Resource):
                 },
                 "original_payload": None,
             },
+        )
+
+
+class Triggers(Resource, _WebhookVerification):
+    """Triggers (instance) class"""
+
+    enable: t.Callable
+    """Enables a trigger given its id"""
+
+    disable: t.Callable
+    """Disables a trigger given its id"""
+
+    # Assigned in the class body so `ResourceMeta` keeps tracing them under
+    # this class's name.
+    verify_webhook = _WebhookVerification.verify_webhook
+    parse = _WebhookVerification.parse
+
+    def __init__(
+        self,
+        client: HttpClient,
+        toolkit_versions: t.Optional[ToolkitVersionParam] = None,
+    ):
+        """
+        Initialize the triggers resource.
+
+        :param client: The client to use for the triggers resource.
+        :param toolkit_versions: The versions of the toolkits to use. Defaults to 'latest' if not provided.
+        """
+        self._client = client
+        self._toolkit_versions = toolkit_versions
+        self.list_enum = self._client.triggers_types.retrieve_enum
+        self.delete = self._client.trigger_instances.manage.delete
+        self.enable = functools.partial(
+            self._client.trigger_instances.manage.update,
+            status="enable",
+        )
+        self.disable = functools.partial(
+            self._client.trigger_instances.manage.update,
+            status="disable",
+        )
+
+    def set_webhook_subscription(
+        self,
+        *,
+        webhook_url: str,
+        enabled_events: t.Optional[t.Sequence[str]] = None,
+        version: t.Union[WebhookVersion, str] = WebhookVersion.V3,
+    ) -> WebhookSubscription:
+        """
+        Create or update the project webhook subscription used for webhook delivery.
+
+        If a subscription already exists, the first subscription is updated. Otherwise a
+        new subscription is created. By default this subscribes to V3 trigger message
+        events.
+
+        Example:
+            composio.triggers.set_webhook_subscription(
+                webhook_url=f"{APP_URL}/webhooks/composio",
+            )
+        """
+        return WebhookSubscriptions(client=self._client).set(
+            webhook_url=webhook_url,
+            enabled_events=enabled_events,
+            version=version,
+        )
+
+    def get_type(self, slug: str) -> TriggersTypeRetrieveResponse:
+        """
+        Get a trigger type by its slug
+        Uses the global toolkit version provided when initializing composio instance to fetch trigger for specific toolkit version
+
+        :param slug: The slug of the trigger type
+        :return: The trigger type
+        """
+        return self._client.triggers_types.retrieve(
+            slug=slug, toolkit_versions=none_to_omit(self._toolkit_versions)
+        )
+
+    def list_active(
+        self,
+        trigger_ids: t.Optional[list[str]] = None,
+        trigger_names: t.Optional[list[str]] = None,
+        auth_config_ids: t.Optional[list[str]] = None,
+        connected_account_ids: t.Optional[list[str]] = None,
+        show_disabled: t.Optional[bool] = None,
+        limit: t.Optional[int] = None,
+        cursor: t.Optional[str] = None,
+    ):
+        """
+        List all active triggers
+
+        :param trigger_ids: List of trigger IDs to filter by
+        :param trigger_names: List of trigger names to filter by
+        :param auth_config_ids: List of auth config IDs to filter by
+        :param connected_account_ids: List of connected account IDs to filter by
+        :param show_disabled: Whether to show disabled triggers
+        :param limit: Limit the number of triggers to return
+        :param cursor: Cursor for pagination. Use the nextCursor from the response to get the next page.
+        :return: List of active triggers
+        """
+        return self._client.trigger_instances.list_active(
+            query_trigger_ids_1=trigger_ids,
+            query_trigger_names_1=trigger_names,
+            query_auth_config_ids_1=auth_config_ids,
+            query_connected_account_ids_1=connected_account_ids,
+            query_show_disabled_1=show_disabled,
+            limit=limit if limit is not None else omit,
+            cursor=cursor if cursor is not None else omit,
+        )
+
+    def list(
+        self,
+        *,
+        cursor: t.Optional[str] = None,
+        limit: t.Optional[int] = None,
+        toolkit_slugs: t.Optional[list[str]] = None,
+    ):
+        """
+        List all the trigger types.
+
+        :param cursor: The cursor for pagination
+        :param limit: The maximum number of trigger types to return
+        :param toolkit_slugs: Filter by toolkit slugs
+        :return: The list of trigger types
+        """
+        return self._client.triggers_types.list(
+            cursor=none_to_omit(cursor),
+            limit=none_to_omit(limit),
+            toolkit_slugs=none_to_omit(toolkit_slugs),
+            toolkit_versions=none_to_omit(self._toolkit_versions),
+        )
+
+    @t.overload
+    def create(
+        self,
+        slug: str,
+        *,
+        connected_account_id: str,
+        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
+        type: t.Optional[t.Literal["webhook", "poll"]] = None,
+        polling_interval: t.Optional[int] = None,
+    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse: ...
+
+    @t.overload
+    def create(
+        self,
+        slug: str,
+        *,
+        user_id: str,
+        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
+        type: t.Optional[t.Literal["webhook", "poll"]] = None,
+        polling_interval: t.Optional[int] = None,
+    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse: ...
+
+    def create(
+        self,
+        slug: str,
+        *,
+        user_id: t.Optional[str] = None,
+        connected_account_id: t.Optional[str] = None,
+        trigger_config: t.Optional[t.Dict[str, t.Any]] = None,
+        type: t.Optional[t.Literal["webhook", "poll"]] = None,
+        polling_interval: t.Optional[int] = None,
+    ) -> trigger_instance_upsert_response.TriggerInstanceUpsertResponse:
+        """
+        Create a trigger instance
+
+        :param slug: The slug of the trigger
+        :param user_id: The ID of the user that owns the connected account. When
+            ``connected_account_id`` is omitted, the backend resolves the first
+            active connection for this user and the trigger's toolkit.
+        :param connected_account_id: The ID of the connected account to pin
+        :param trigger_config: The configuration of the trigger
+        :param type: ``webhook`` or ``poll``, for a trigger that supports both.
+            Omit it to let Composio choose.
+        :param polling_interval: Minutes between polls, for an instance that polls.
+            Wins over ``trigger_config["interval"]``.
+        :return: The trigger instance, with the ``type`` it uses, the
+            ``fallback_reason`` when it polls after a webhook was unavailable, and
+            its ``polling_interval``
+        """
+        # Treat blank strings as missing so an empty or whitespace-only
+        # `user_id` / `connected_account_id` does not slip past the guard below
+        # or reach the backend (parity with the TypeScript SDK's `userId` check).
+        if isinstance(user_id, str) and not user_id.strip():
+            user_id = None
+        if isinstance(connected_account_id, str) and not connected_account_id.strip():
+            connected_account_id = None
+
+        if user_id is None and connected_account_id is None:
+            raise exceptions.InvalidParams(
+                "please provide valid `connected_account_id` or `user_id`"
+            )
+
+        # Validate the trigger slug up-front so callers get a clear
+        # `TriggerTypeNotFound` (parity with the TypeScript SDK).
+        try:
+            self.get_type(slug=slug)
+        except APIStatusError as error:
+            if error.status_code in (400, 404):
+                raise exceptions.TriggerTypeNotFound(
+                    f"Trigger type {slug} not found"
+                ) from error
+            raise
+
+        # Pass user_id straight through: when connected_account_id is omitted the
+        # backend resolves the first active connection for this user and the
+        # trigger's toolkit (parity with tool execution). When 2FA is enabled and
+        # connected_account_id is pinned, the backend validates that user_id owns it.
+        return self._client.trigger_instances.upsert(
+            slug=slug,
+            connected_account_id=none_to_omit(connected_account_id),
+            toolkit_versions=self._toolkit_versions,
+            body_trigger_config_1=none_to_omit(trigger_config),
+            type=none_to_omit(type),
+            polling_interval=none_to_omit(polling_interval),
+            user_id=none_to_omit(user_id),
+        )
+
+    def subscribe(
+        self,
+        timeout: float = 15.0,
+        on_subscription_error: t.Optional[SubscriptionErrorCallback] = None,
+    ) -> TriggerSubscription:
+        """
+        Subscribe to a trigger and receive trigger events.
+
+        :param timeout: The timeout to wait for the subscription to be established.
+        :param on_subscription_error: Optional callback invoked when the channel
+            subscription fails: with the raw Pusher payload for asynchronous
+            ``pusher:subscription_error`` events (for example a later permission
+            rejection), or with ``{"error": ...}`` for failures raised while
+            establishing the subscription (for example an auth rejection —
+            pysher performs channel auth synchronously). Establish-time failures
+            also make ``subscribe()`` raise the underlying error promptly
+            instead of waiting out the timeout. Exceptions raised inside the
+            callback are contained and logged, never rethrown.
+        :return: The trigger subscription handler.
+        """
+        return _SubcriptionBuilder(client=self._client).connect(
+            timeout=timeout,
+            on_subscription_error=on_subscription_error,
         )

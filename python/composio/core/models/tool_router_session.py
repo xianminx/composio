@@ -313,61 +313,136 @@ _CUSTOM_TOOLKITS_DEPRECATION = (
 )
 
 
-class ToolRouterSession(t.Generic[TTool, TToolCollection]):
-    """
-    A Composio session — the object returned by ``composio.create(...)`` /
-    ``composio.use(...)``. Use it to fetch session-scoped tools, authorize
-    toolkits, search, and execute tools.
+@dataclass
+class _MultiExecuteSplit:
+    """A COMPOSIO_MULTI_EXECUTE_TOOL call partitioned by where each item runs."""
 
-    Generic Parameters:
-        TTool: The individual tool type returned by the provider.
-        TToolCollection: The collection type returned by tools().
+    tool_items: t.List[t.Any]
+    parsed: t.List[t.Dict[str, t.Any]]
+    local_items: t.List[t.Tuple[int, CustomToolsMapEntry]]
+    remote_indices: t.List[int]
 
-    The hosted MCP endpoint (``session.mcp``) exists at runtime on every
-    session, but is only surfaced in the type when you opt in with
-    ``create(..., mcp=True)`` / ``use(..., mcp=True)``, which returns a
-    :class:`ToolRouterSessionWithMcp`. By default agents use native tools via
-    :meth:`tools`. See https://docs.composio.dev/docs/sessions-via-mcp
 
-    Attributes:
-        session_id: Unique session identifier
-        config: Server-side session configuration as returned by the API,
-                refreshed in place by :meth:`update`
-        experimental: Experimental features (files, assistive prompt, etc.)
-    """
+def _toolkits_query(
+    *,
+    toolkits: t.Optional[t.List[str]],
+    next_cursor: t.Optional[str],
+    limit: t.Optional[int],
+    is_connected: t.Optional[bool],
+    search: t.Optional[str],
+) -> t.Dict[str, t.Any]:
+    toolkits_params: t.Dict[str, t.Any] = {}
+    if next_cursor is not None:
+        toolkits_params["cursor"] = next_cursor
+    if limit is not None:
+        toolkits_params["limit"] = limit
+    if toolkits is not None:
+        toolkits_params["toolkits"] = toolkits
+    if is_connected is not None:
+        toolkits_params["is_connected"] = is_connected
+    if search is not None:
+        toolkits_params["search"] = search
+    return toolkits_params
 
-    #: Unique session identifier.
+
+def _toolkit_connections_details(result: t.Any) -> ToolkitConnectionsDetails:
+    """A ``session.toolkits`` response as the SDK's connection states."""
+    from composio.core.models.tool_router import (
+        ToolkitConnectedAccount,
+        ToolkitConnection,
+        ToolkitConnectionAuthConfig,
+        ToolkitConnectionsDetails,
+        ToolkitConnectionState,
+    )
+
+    toolkit_states: t.List[ToolkitConnectionState] = []
+    for item in result.items:
+        connected_account = item.connected_account
+        auth_config: t.Optional[ToolkitConnectionAuthConfig] = None
+        connected_acc: t.Optional[ToolkitConnectedAccount] = None
+
+        if connected_account:
+            if connected_account.auth_config:
+                auth_config = ToolkitConnectionAuthConfig(
+                    id=connected_account.auth_config.id,
+                    mode=connected_account.auth_config.auth_scheme,
+                    is_composio_managed=connected_account.auth_config.is_composio_managed,
+                )
+            connected_acc = ToolkitConnectedAccount(
+                id=connected_account.id,
+                status=connected_account.status,
+            )
+
+        connection = (
+            None
+            if item.is_no_auth
+            else ToolkitConnection(
+                is_active=(
+                    connected_account.status == "ACTIVE" if connected_account else False
+                ),
+                auth_config=auth_config,
+                connected_account=connected_acc,
+            )
+        )
+
+        toolkit_state = ToolkitConnectionState(
+            slug=item.slug,
+            name=item.name,
+            logo=item.meta.logo if item.meta else None,
+            is_no_auth=item.is_no_auth if item.is_no_auth else False,
+            connection=connection,
+        )
+        toolkit_states.append(toolkit_state)
+
+    return ToolkitConnectionsDetails(
+        items=toolkit_states,
+        next_cursor=result.next_cursor,
+        total_pages=int(result.total_pages),
+    )
+
+
+def _local_execute_response(
+    result: ToolExecutionResponse,
+) -> ToolRouterSessionExecuteResponse:
+    """An in-process custom tool result in the session execute shape."""
+    return ToolRouterSessionExecuteResponse(
+        data=result["data"],
+        error=result["error"],
+        log_id="",
+        result_type="completed" if result["successful"] else "failed",
+    )
+
+
+class _ToolRouterSessionBase(t.Generic[TTool, TToolCollection]):
+    """Everything a session and its async twin do besides the API calls."""
+
     session_id: str
-    #: Server-side session configuration (toolkit/tool allowlists, tags,
-    #: preload, sandbox, manage_connections) as returned by the API. Refreshed
-    #: in place by :meth:`update`.
     config: ToolRouterSessionConfig
-    #: Experimental capabilities available on this session.
-    experimental: "ToolRouterSessionExperimental"
-    #: Version of the server-side configuration this object last observed.
-    #: Refreshed in place by :meth:`update`. Pass it as ``expected_config_version``
-    #: to make an update conditional.
     config_version: t.Optional[int]
+    preload: ToolRouterSessionPreloadConfig
+    _client: t.Any
+    _provider: t.Optional[BaseProvider[t.Any, t.Any]]
+    _custom_tools_map: t.Optional[CustomToolsMap]
 
-    def __init__(
+    def _init_session(
         self,
         *,
-        client: HttpClient,
+        client: t.Any,
         provider: t.Optional[BaseProvider[t.Any, t.Any]],
         dangerously_allow_auto_upload_download_files: bool,
-        sensitive_file_upload_protection: bool = True,
-        file_upload_path_deny_segments: t.Optional[t.Sequence[str]] = None,
-        file_upload_dirs: t.Union[t.Sequence[str], t.Literal[False], None] = None,
+        sensitive_file_upload_protection: bool,
+        file_upload_path_deny_segments: t.Optional[t.Sequence[str]],
+        file_upload_dirs: t.Union[t.Sequence[str], t.Literal[False], None],
         session_id: str,
         mcp: t.Any,
-        experimental: "ToolRouterSessionExperimental",
-        config: t.Optional[ToolRouterSessionConfig] = None,
-        config_version: t.Optional[int] = None,
-        custom_tools_map: t.Optional[CustomToolsMap] = None,
-        user_id: t.Optional[str] = None,
-        preload: t.Optional[ToolRouterSessionPreloadConfig] = None,
-        preloaded_custom_tool_slugs: t.Optional[t.List[str]] = None,
-        inline_custom_tools_payload: t.Optional[InlineCustomToolsWirePayload] = None,
+        experimental: t.Any,
+        config: t.Optional[ToolRouterSessionConfig],
+        config_version: t.Optional[int],
+        custom_tools_map: t.Optional[CustomToolsMap],
+        user_id: t.Optional[str],
+        preload: t.Optional[ToolRouterSessionPreloadConfig],
+        preloaded_custom_tool_slugs: t.Optional[t.List[str]],
+        inline_custom_tools_payload: t.Optional[InlineCustomToolsWirePayload],
     ) -> None:
         self._client = client
         self._provider = provider
@@ -403,105 +478,11 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
         self._preloaded_custom_tool_slugs = preloaded_custom_tool_slugs or []
         self._inline_custom_tools_payload = inline_custom_tools_payload
 
-        # Create singleton session context if custom tools are bound
-        self._session_context: t.Optional[SessionContextImpl] = None
-        if custom_tools_map and user_id:
-            self._session_context = SessionContextImpl(
-                client=client,
-                user_id=user_id,
-                session_id=session_id,
-                custom_tools_map=custom_tools_map,
-                inline_custom_tools_payload=inline_custom_tools_payload,
-            )
-
     def _has_custom_tools(self) -> bool:
         """Check if this session has any custom tools bound."""
         if self._custom_tools_map is None:
             return False
         return len(self._custom_tools_map.by_final_slug) > 0
-
-    def _tool_router_backend_execute(
-        self,
-        tools_model: t.Any,
-        modifiers: t.Optional["Modifiers"] = None,
-    ) -> t.Callable[..., t.Any]:
-        """Backend execute wrapper with this session's file-upload settings."""
-        return tools_model._wrap_execute_tool_for_tool_router(
-            session_id=self.session_id,
-            modifiers=modifiers,
-            inline_custom_tools_payload=self._inline_custom_tools_payload,
-        )
-
-    def tools(self, modifiers: t.Optional["Modifiers"] = None) -> TToolCollection:
-        """
-        Get provider-wrapped tools for execution with your AI framework.
-
-        Returns tools configured for this session, wrapped in the format expected
-        by your AI provider (OpenAI, Anthropic, LangChain, etc.).
-
-        When custom tools are bound to the session, execution of
-        COMPOSIO_MULTI_EXECUTE_TOOL is intercepted: local tools are executed
-        in-process, remote tools are sent to the backend.
-        """
-        from composio.core.models.tools import Tools as ToolsModel
-        from composio.core.provider import (
-            AgenticProvider,
-            NonAgenticProvider,
-            bind_execution_target,
-        )
-
-        if self._provider is None:
-            raise ValueError(
-                "Provider is required for tool router. "
-                "Please initialize ToolRouter with a provider."
-            )
-
-        tools_model = ToolsModel(
-            client=self._client,
-            provider=self._provider,
-            dangerously_allow_auto_upload_download_files=self._auto_upload_download_files,
-            sensitive_file_upload_protection=self._sensitive_file_upload_protection,
-            file_upload_path_deny_segments=self._file_upload_path_deny_segments,
-            file_upload_dirs=self._file_upload_dirs,
-        )
-
-        router_tools = tools_model.get_raw_tool_router_meta_tools(
-            session_id=self.session_id,
-            modifiers=modifiers,
-        )
-        router_tools = self._add_preloaded_custom_tools(router_tools, modifiers)
-
-        for tool in router_tools:
-            tool.input_parameters = (
-                tools_model._file_helper.enhance_schema_descriptions(
-                    schema=tool.input_parameters,
-                )
-            )
-
-        if issubclass(type(self._provider), NonAgenticProvider):
-            return t.cast(
-                TToolCollection,
-                t.cast(
-                    NonAgenticProvider[TTool, TToolCollection], self._provider
-                ).wrap_tools(tools=router_tools),
-            )
-
-        # For agentic providers: if custom tools are bound, create a routing
-        # execute function that intercepts COMPOSIO_MULTI_EXECUTE_TOOL
-        if self._has_custom_tools():
-            execute_fn = self._create_routing_execute_fn(tools_model, modifiers)
-        else:
-            execute_fn = self._tool_router_backend_execute(
-                tools_model, modifiers=modifiers
-            )
-
-        return t.cast(
-            TToolCollection,
-            t.cast(AgenticProvider[TTool, TToolCollection], self._provider).wrap_tools(
-                tools=router_tools,
-                execute_tool=bind_execution_target(execute_fn, self),
-            ),
-        )
 
     def _add_preloaded_custom_tools(
         self,
@@ -592,69 +573,6 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
                 return toolkit.name
         return None
 
-    def _create_routing_execute_fn(
-        self,
-        tools_model: t.Any,
-        modifiers: t.Optional["Modifiers"],
-    ) -> t.Callable[..., t.Any]:
-        """Create an execute function that routes local/remote tools.
-
-        Applies before_execute/after_execute modifiers around the overall
-        COMPOSIO_MULTI_EXECUTE_TOOL call, consistent with the standard path.
-        """
-        backend_execute = self._tool_router_backend_execute(
-            tools_model, modifiers=modifiers
-        )
-
-        def routing_execute(slug: str, arguments: t.Dict) -> t.Dict:
-            if slug == COMPOSIO_MULTI_EXECUTE_TOOL:
-                # Apply before_execute modifiers
-                processed_arguments = arguments
-                if modifiers is not None:
-                    type_before: t.Literal["before_execute"] = "before_execute"
-                    params: ToolExecuteParams = {"arguments": arguments}
-                    modified = apply_modifier_by_type(
-                        modifiers=modifiers,
-                        toolkit="composio",
-                        tool=slug,
-                        type=type_before,
-                        request=params,
-                    )
-                    processed_arguments = modified.get("arguments", arguments)
-
-                result = self._route_multi_execute(processed_arguments, tools_model)
-
-                # Apply after_execute modifiers
-                if modifiers is not None:
-                    type_after: t.Literal["after_execute"] = "after_execute"
-                    result = t.cast(
-                        t.Dict[str, t.Any],
-                        apply_modifier_by_type(
-                            modifiers=modifiers,
-                            toolkit="composio",
-                            tool=slug,
-                            type=type_after,
-                            response=t.cast(ToolExecutionResponse, result),
-                        ),
-                    )
-
-                return result
-            entry = find_custom_tool(self._custom_tools_map, slug)
-            if entry:
-                return t.cast(
-                    t.Dict[str, t.Any],
-                    execute_custom_tool(
-                        entry,
-                        arguments,
-                        t.cast(SessionContextImpl, self._session_context),
-                    ),
-                )
-            assert_unambiguous_custom_tool_slug(self._custom_tools_map, slug)
-            # Non-multi-execute meta tools always go to backend
-            return backend_execute(slug, arguments)
-
-        return routing_execute
-
     def _parse_tool_item(self, item: t.Any) -> t.Dict[str, t.Any]:
         """Parse an individual tool item from COMPOSIO_MULTI_EXECUTE_TOOL's tools array."""
         if not isinstance(item, dict):
@@ -664,26 +582,14 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
             "arguments": item.get("arguments", {}),
         }
 
-    def _route_multi_execute(
-        self,
-        input_args: t.Dict[str, t.Any],
-        tools_model: t.Any,
-    ) -> t.Dict[str, t.Any]:
-        """Route a COMPOSIO_MULTI_EXECUTE_TOOL call.
-
-        Splits the tools[] array into local and remote, executes each
-        appropriately, and merges results in the original request order.
-
-        Modifiers are NOT applied here — the caller (routing_execute)
-        handles before_execute/after_execute to avoid double application.
-        """
+    def _split_multi_execute(
+        self, input_args: t.Dict[str, t.Any]
+    ) -> t.Optional[_MultiExecuteSplit]:
+        """Partition a COMPOSIO_MULTI_EXECUTE_TOOL call into local and remote
+        items, or ``None`` when the whole call belongs to the backend."""
         tool_items = input_args.get("tools")
         if not isinstance(tool_items, list) or len(tool_items) == 0:
-            # Fallback: send to backend as-is (no modifiers — caller handles them)
-            return self._tool_router_backend_execute(tools_model)(
-                COMPOSIO_MULTI_EXECUTE_TOOL,
-                input_args,
-            )
+            return None
 
         parsed = [self._parse_tool_item(item) for item in tool_items]
 
@@ -700,67 +606,24 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
                 )
                 remote_indices.append(i)
 
-        # All remote — just forward entire payload (no modifiers — caller handles them)
         if not local_items:
-            return self._tool_router_backend_execute(tools_model)(
-                COMPOSIO_MULTI_EXECUTE_TOOL,
-                input_args,
-            )
+            return None
+        return _MultiExecuteSplit(
+            tool_items=tool_items,
+            parsed=parsed,
+            local_items=local_items,
+            remote_indices=remote_indices,
+        )
 
-        ctx = self._session_context
-        assert ctx is not None
-
-        # Determine worker count (capped at MAX_PARALLEL_WORKERS)
-        num_tasks = len(local_items) + (1 if remote_indices else 0)
-        num_workers = min(MAX_PARALLEL_WORKERS, num_tasks)
-
-        with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            # Submit local tool executions
-            local_futures = []
-            for idx, entry in local_items:
-                future = pool.submit(
-                    execute_custom_tool,
-                    entry,
-                    parsed[idx]["arguments"],
-                    ctx,
-                )
-                local_futures.append((idx, future))
-
-            # Submit remote batch (single call) if any
-            # No modifiers here — the outer routing_execute handles them
-            remote_future = None
-            if remote_indices:
-                remote_tool_items = [tool_items[i] for i in remote_indices]
-                remote_input = {**input_args, "tools": remote_tool_items}
-                execute_fn = self._tool_router_backend_execute(tools_model)
-                remote_future = pool.submit(
-                    execute_fn,
-                    COMPOSIO_MULTI_EXECUTE_TOOL,
-                    remote_input,
-                )
-
-            # Gather local results
-            local_results: t.List[t.Tuple[int, ToolExecutionResponse]] = []
-            for idx, future in local_futures:
-                local_results.append((idx, future.result()))
-
-            # Gather remote result. A transport failure (exception from the
-            # backend call) must not discard completed local results, so it
-            # is captured here and surfaced as per-tool failures below
-            # (matches TS).
-            remote_result: t.Optional[t.Dict[str, t.Any]] = None
-            remote_error_message: t.Optional[str] = None
-            if remote_future:
-                try:
-                    remote_result = remote_future.result()
-                except exceptions.ToolInputRequiredError:
-                    # An input request is not a per-tool failure: re-raise it so
-                    # the caller gets `input_requests` and `request_state`.
-                    # Accepted: local tools in this batch already ran and their results are discarded.
-                    raise
-                except Exception as error:
-                    remote_error_message = str(error) or "Remote tool execution failed"
-
+    @staticmethod
+    def _merge_multi_execute(
+        split: _MultiExecuteSplit,
+        local_results: t.List[t.Tuple[int, ToolExecutionResponse]],
+        remote_result: t.Optional[t.Dict[str, t.Any]],
+        remote_error_message: t.Optional[str],
+    ) -> t.Dict[str, t.Any]:
+        """Merge local and remote results back into the original request order."""
+        parsed, remote_indices = split.parsed, split.remote_indices
         # If only one local tool and no remote, return unwrapped
         if not remote_indices and len(local_results) == 1:
             return t.cast(t.Dict[str, t.Any], local_results[0][1])
@@ -859,295 +722,167 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
             merged["instant_charge"] = remote_result["instant_charge"]
         return merged
 
-    def authorize(
+    def _patch_request(
         self,
-        toolkit: str,
         *,
-        callback_url: t.Optional[str] = None,
-        alias: t.Optional[str] = None,
-        experimental: t.Optional[session_link_params.Experimental] = None,
-    ) -> ConnectionRequest:
-        """
-        Authorize a toolkit for the user and get a connection request.
+        toolkits: t.Any,
+        instant: t.Any,
+        tools: t.Any,
+        tags: t.Any,
+        auth_configs: t.Any,
+        connected_accounts: t.Any,
+        manage_connections: t.Any,
+        sandbox: t.Any,
+        workbench: t.Any,
+        multi_account: t.Any,
+        proxy_execute: t.Any,
+        hooks: t.Any,
+        preload: t.Any,
+        search: t.Any,
+        execute: t.Any,
+        experimental: t.Any,
+        expected_config_version: t.Union[int, None, t.Literal[False]],
+    ) -> t.Tuple[t.Dict[str, t.Any], t.Union[int, "Omit"]]:
+        """Validate ``update()`` arguments; return the ``session.patch`` keyword
+        arguments and the version precondition sent with them."""
+        if sandbox is not omit and workbench is not omit:
+            raise exceptions.InvalidParams(
+                "Pass either `sandbox` or `workbench`, not both. "
+                "`workbench` is a backwards-compatible alias for `sandbox`."
+            )
+        if instant is None:
+            raise exceptions.InvalidParams(
+                "`instant` does not accept None; pass False to disable "
+                "Instant usage, or omit it to keep the stored policy"
+            )
+        if (
+            not isinstance(hooks, Omit)
+            and isinstance(experimental, dict)
+            and experimental.get("session_config_id") is not None
+        ):
+            raise exceptions.InvalidParams(
+                "`hooks` cannot be combined with `experimental={'session_config_id': ...}`; "
+                "a saved Session config sets the session's access policy, so apply "
+                "hooks in a separate update"
+            )
 
-        Initiates the OAuth flow and returns a ConnectionRequest with redirect URL.
+        precondition: t.Union[int, "Omit"]
+        if expected_config_version is None or expected_config_version is False:
+            precondition = omit
+        elif isinstance(expected_config_version, bool) or expected_config_version < 1:
+            raise exceptions.InvalidParams(
+                "`expected_config_version` must be a positive integer, or False to "
+                "send no precondition"
+            )
+        else:
+            precondition = expected_config_version
 
-        :param alias: Human-readable alias for the connection. Must be unique
-            per userId and toolkit within the project.
-        :param experimental: Experimental options for this connection. Pass an
-            ``Experimental`` dict with ``account_type`` and/or
-            ``acl_config_for_shared`` to create a SHARED connection with a
-            per-user ACL. Experimental — shape may change in future releases.
-        """
-        try:
-            response = self._client.tool_router.session.link(
+        workbench_payload = sandbox if sandbox is not omit else workbench
+
+        # The spec does not declare the ``expected_config_version`` precondition
+        # until ComposioHQ/platform#13157 lands, so it travels as an extra root
+        # body field.
+        extra_body: t.Optional[t.Dict[str, t.Any]] = (
+            None
+            if isinstance(precondition, Omit)
+            else {"expected_config_version": precondition}
+        )
+
+        # Until ComposioHQ/platform#13157 lands, the spec does not mark every
+        # policy block nullable although the API accepts ``None`` (it removes the
+        # stored override), nor the subfield removals inside
+        # ``manage_connections``, ``multi_account`` and ``experimental``; the
+        # values are serialized as-is.
+        return (
+            dict(
                 session_id=self.session_id,
-                toolkit=toolkit,
-                callback_url=callback_url if callback_url else omit,
-                alias=alias if alias is not None else omit,
-                experimental=experimental if experimental is not None else omit,
-            )
-        except BadRequestError as error:
-            # The server rejects ACL on PRIVATE connections — surface that
-            # as a typed error mirroring ``composio.connected_accounts.link()``.
-            message = str(error)
-            if ACL_ONLY_FOR_SHARED_ERROR_FRAGMENT in message:
-                raise exceptions.ComposioAclOnlyForSharedError(message) from error
-            raise
-
-        return ConnectionRequest(
-            id=response.connected_account_id,
-            redirect_url=response.redirect_url,
-            status="INITIATED",
-            client=self._client,
-        )
-
-    def toolkits(
-        self,
-        *,
-        toolkits: t.Optional[t.List[str]] = None,
-        next_cursor: t.Optional[str] = None,
-        limit: t.Optional[int] = None,
-        is_connected: t.Optional[bool] = None,
-        search: t.Optional[str] = None,
-    ) -> ToolkitConnectionsDetails:
-        """
-        Get toolkit connection states for the session.
-        """
-        from composio.core.models.tool_router import (
-            ToolkitConnectedAccount,
-            ToolkitConnection,
-            ToolkitConnectionAuthConfig,
-            ToolkitConnectionsDetails,
-            ToolkitConnectionState,
-        )
-
-        toolkits_params: t.Dict[str, t.Any] = {}
-        if next_cursor is not None:
-            toolkits_params["cursor"] = next_cursor
-        if limit is not None:
-            toolkits_params["limit"] = limit
-        if toolkits is not None:
-            toolkits_params["toolkits"] = toolkits
-        if is_connected is not None:
-            toolkits_params["is_connected"] = is_connected
-        if search is not None:
-            toolkits_params["search"] = search
-
-        result = self._client.tool_router.session.toolkits(
-            session_id=self.session_id,
-            **toolkits_params,
-        )
-
-        toolkit_states: t.List[ToolkitConnectionState] = []
-        for item in result.items:
-            connected_account = item.connected_account
-            auth_config: t.Optional[ToolkitConnectionAuthConfig] = None
-            connected_acc: t.Optional[ToolkitConnectedAccount] = None
-
-            if connected_account:
-                if connected_account.auth_config:
-                    auth_config = ToolkitConnectionAuthConfig(
-                        id=connected_account.auth_config.id,
-                        mode=connected_account.auth_config.auth_scheme,
-                        is_composio_managed=connected_account.auth_config.is_composio_managed,
-                    )
-                connected_acc = ToolkitConnectedAccount(
-                    id=connected_account.id,
-                    status=connected_account.status,
-                )
-
-            connection = (
-                None
-                if item.is_no_auth
-                else ToolkitConnection(
-                    is_active=(
-                        connected_account.status == "ACTIVE"
-                        if connected_account
-                        else False
-                    ),
-                    auth_config=auth_config,
-                    connected_account=connected_acc,
-                )
-            )
-
-            toolkit_state = ToolkitConnectionState(
-                slug=item.slug,
-                name=item.name,
-                logo=item.meta.logo if item.meta else None,
-                is_no_auth=item.is_no_auth if item.is_no_auth else False,
-                connection=connection,
-            )
-            toolkit_states.append(toolkit_state)
-
-        return ToolkitConnectionsDetails(
-            items=toolkit_states,
-            next_cursor=result.next_cursor,
-            total_pages=int(result.total_pages),
-        )
-
-    def search(
-        self,
-        *,
-        query: str,
-        model: t.Optional[str] = None,
-    ) -> ToolRouterSessionSearchResponse:
-        """
-        Search for tools by semantic use case.
-
-        Returns relevant tools for the given query with schemas and guidance.
-        """
-        return self._client.tool_router.session.search(
-            session_id=self.session_id,
-            queries=[{"use_case": query}],
-            model=model if model else omit,
-            experimental=self._inline_custom_tools_payload
-            if self._inline_custom_tools_payload is not None
-            else omit,
-        )
-
-    def execute(
-        self,
-        tool_slug: str,
-        *,
-        arguments: t.Optional[t.Dict[str, t.Any]] = None,
-        account: t.Optional[str] = None,
-        input_responses: t.Optional[t.Dict[str, ToolRouterInputResponse]] = None,
-        request_state: t.Optional[str] = None,
-    ) -> ToolRouterSessionExecuteResponse:
-        """
-        Execute a tool within the session.
-
-        Use ``tool_slug=...`` (not the direct Tools API's ``slug=...``) and
-        ``arguments={...}``. The return value is a Pydantic model: read
-        ``result.result_type == "completed"`` for execution success,
-        ``result.model_dump(mode="json")`` for a JSON-compatible dictionary,
-        or ``result.model_dump_json()`` for a JSON string. Unlike provider
-        helper results and ``after_execute`` modifier dictionaries, it has
-        no ``successful`` key. This call has no model tool-call ID; retain
-        that ID separately when building provider messages.
-
-        For custom tools, accepts the full slug (e.g. "LOCAL_GREP") or the
-        original slug (e.g. "GREP") when that original slug is unique across
-        the session's custom tools and toolkits. Custom tools are executed
-        in-process; remote tools are sent to the Composio backend.
-
-        :param account: Account ID or alias for direct app tool execution in
-            multi-account sessions. Helper/meta tools either ignore this
-            top-level field or define their own account-selection fields.
-        :param input_responses: Experimental. The user's answers to an earlier
-            ``ToolInputRequiredError``, keyed by the IDs in its
-            ``input_requests``. Repeat the same call (same tool and arguments)
-            with them. An approved call runs; a denied or declined one returns
-            ``result_type="failed"``.
-        :param request_state: Experimental. The ``request_state`` of that
-            error, sent back unchanged.
-
-        Both paths return a ``ToolRouterSessionExecuteResponse`` with ``data``,
-        ``error``, ``log_id``, ``result_type``, and ``instant_charge``
-        attributes. ``result_type`` is ``"completed"``, ``"failed"`` or
-        ``"blocked"``; a failed execution can carry a ``None`` or empty
-        ``error``, so read ``result_type`` to tell them apart. A ``"blocked"``
-        call (a session hook blocked it) has empty ``data``, the hook's message
-        in ``error``, and ``block_reason`` (``type`` and ``hook_id``).
-        ``hook_results`` lists every session hook that applied.
-        A log ID correlates an execution; it does not prove that a provider
-        performed a side effect. Inspect the tool-specific ``data`` as well.
-        Transport and authentication errors raise instead of returning an
-        execution result. Handle authentication recovery separately from
-        returned tool failures; retry/idempotency decisions belong to you.
-
-        :raises ToolInputRequiredError: If the tool needs input from the user
-            (for example an approval) before it can run. Nothing was executed.
-        :raises ValidationError: If the API response carries no ``result_type``,
-            or one this SDK does not know.
-        """
-        # Check if this is a local tool (by original or final slug)
-        entry = find_custom_tool(self._custom_tools_map, tool_slug)
-        if entry and self._session_context:
-            result = execute_custom_tool(entry, arguments or {}, self._session_context)
-            return ToolRouterSessionExecuteResponse(
-                data=result["data"],
-                error=result["error"],
-                log_id="",
-                result_type="completed" if result["successful"] else "failed",
-            )
-
-        assert_unambiguous_custom_tool_slug(self._custom_tools_map, tool_slug)
-
-        # Disable retries: a session execution is a non-idempotent write, and a
-        # silent retry after a read timeout can duplicate the side effect.
-        return require_execute_result(
-            self._client.without_retries.tool_router.session.execute(
-                session_id=self.session_id,
-                tool_slug=tool_slug,
-                arguments=arguments if arguments is not None else omit,
-                account=account if account is not None else omit,
-                input_responses=(
-                    input_responses if input_responses is not None else omit
+                toolkits=t.cast(
+                    t.Union[session_patch_params.Toolkits, "Omit"], toolkits
                 ),
-                request_state=request_state if request_state is not None else omit,
-                experimental=self._inline_custom_tools_payload
-                if self._inline_custom_tools_payload is not None
-                else omit,
-            ),
-            tool_slug,
-        )
-
-    def execute_meta(
-        self,
-        slug: ToolRouterSessionMetaToolSlug,
-        *,
-        arguments: t.Optional[t.Dict[str, t.Any]] = None,
-        input_responses: t.Optional[t.Dict[str, ToolRouterInputResponse]] = None,
-        request_state: t.Optional[str] = None,
-    ) -> ToolRouterSessionExecuteResponse:
-        """
-        Execute a Composio meta tool (``COMPOSIO_*``) within the session.
-
-        :meth:`execute` also runs meta tools. This method only accepts meta
-        tool slugs, so a typo is a type error instead of a failed request. The
-        call is sent to the Composio backend as is: custom tools named in a
-        ``COMPOSIO_MULTI_EXECUTE_TOOL`` call are not run in-process here.
-
-        :param slug: The meta tool slug to execute.
-        :param arguments: Optional meta tool arguments.
-        :param input_responses: Experimental. The user's answers to an earlier
-            ``ToolInputRequiredError``, keyed by the IDs in its
-            ``input_requests``. Repeat the same call with them, as in :meth:`execute`.
-        :param request_state: Experimental. The ``request_state`` of that
-            error, sent back unchanged.
-        :returns: The tool execution result, in the same shape as
-            :meth:`execute`.
-        :raises ToolInputRequiredError: If the tool needs input from the user
-            (for example an approval) before it can run. Nothing was executed.
-        :raises ValidationError: If the API response carries no ``result_type``,
-            or one this SDK does not know.
-
-        Example:
-            result = session.execute_meta(
-                "COMPOSIO_SEARCH_TOOLS",
-                arguments={"queries": [{"use_case": "send an email"}]},
-            )
-            print(result.result_type, result.data)
-        """
-        # Disable retries: a session execution is a non-idempotent write, and a
-        # silent retry after a read timeout can duplicate the side effect.
-        return require_execute_result(
-            self._client.without_retries.tool_router.session.execute_meta(
-                session_id=self.session_id,
-                slug=slug,
-                arguments=arguments if arguments is not None else omit,
-                input_responses=(
-                    input_responses if input_responses is not None else omit
+                tools=t.cast(
+                    t.Union[t.Dict[str, session_patch_params.Tools], "Omit"], tools
                 ),
-                request_state=request_state if request_state is not None else omit,
-                experimental=self._inline_custom_tools_payload
-                if self._inline_custom_tools_payload is not None
-                else omit,
+                tags=t.cast(t.Union[session_patch_params.Tags, "Omit"], tags),
+                instant=t.cast(
+                    t.Union[
+                        t.Literal[False],
+                        session_patch_params.CurrentInstantVariant1,
+                        "Omit",
+                    ],
+                    instant,
+                ),
+                auth_configs=t.cast(t.Union[t.Dict[str, str], "Omit"], auth_configs),
+                connected_accounts=connected_accounts,
+                manage_connections=t.cast(
+                    t.Union[t.Optional[session_patch_params.ManageConnections], "Omit"],
+                    manage_connections,
+                ),
+                workbench=workbench_payload,
+                multi_account=t.cast(
+                    t.Union[t.Optional[session_patch_params.MultiAccount], "Omit"],
+                    multi_account,
+                ),
+                proxy_execute=(
+                    {"enable": proxy_execute}
+                    if isinstance(proxy_execute, bool)
+                    else proxy_execute
+                ),
+                preload=t.cast(t.Union[session_patch_params.Preload, "Omit"], preload),
+                search=t.cast(t.Union[session_patch_params.Search, "Omit"], search),
+                execute=t.cast(t.Union[session_patch_params.Execute, "Omit"], execute),
+                experimental=t.cast(
+                    t.Union[t.Optional[session_patch_params.Experimental], "Omit"],
+                    experimental,
+                ),
+                hooks=t.cast(
+                    t.Union[
+                        t.Optional[
+                            t.Iterable[
+                                t.Union[
+                                    session_patch_params.CurrentHookVariant0,
+                                    session_patch_params.CurrentHookVariant1,
+                                ]
+                            ]
+                        ],
+                        "Omit",
+                    ],
+                    hooks,
+                ),
+                extra_body=extra_body,
+                # A stale precondition is a deterministic 409: never retry it.
+                request_options={"max_retries": 0},
             ),
-            slug,
+            precondition,
         )
+
+    def _patch_conflict(
+        self, precondition: t.Union[int, "Omit"]
+    ) -> exceptions.SessionConfigConflictError:
+        if precondition is omit:
+            message = (
+                f"Session {self.session_id} configuration changed while this "
+                "update was in flight; re-fetch the session and retry the update"
+            )
+        else:
+            message = (
+                f"Session {self.session_id} configuration is no longer at "
+                f"version {precondition}; re-fetch the session and retry the update"
+            )
+        return exceptions.SessionConfigConflictError(
+            message,
+            session_id=self.session_id,
+            expected_config_version=(
+                None if isinstance(precondition, Omit) else precondition
+            ),
+        )
+
+    def _apply_patch(self, response: t.Any) -> ToolRouterSessionConfig:
+        from composio.core.models.tool_router import _session_preload_config
+
+        self.config = t.cast(ToolRouterSessionConfig, response.config)
+        self.config_version = response.config_version
+        self.preload = _session_preload_config(response.config.preload)
+        return self.config
 
     def local_tools(
         self, *, toolkit: t.Optional[str] = None
@@ -1247,6 +982,547 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
             stacklevel=2,
         )
         return self.local_toolkits()
+
+
+class ToolRouterSession(_ToolRouterSessionBase[TTool, TToolCollection]):
+    """
+    A Composio session — the object returned by ``composio.create(...)`` /
+    ``composio.use(...)``. Use it to fetch session-scoped tools, authorize
+    toolkits, search, and execute tools.
+
+    Generic Parameters:
+        TTool: The individual tool type returned by the provider.
+        TToolCollection: The collection type returned by tools().
+
+    The hosted MCP endpoint (``session.mcp``) exists at runtime on every
+    session, but is only surfaced in the type when you opt in with
+    ``create(..., mcp=True)`` / ``use(..., mcp=True)``, which returns a
+    :class:`ToolRouterSessionWithMcp`. By default agents use native tools via
+    :meth:`tools`. See https://docs.composio.dev/docs/sessions-via-mcp
+
+    Attributes:
+        session_id: Unique session identifier
+        config: Server-side session configuration as returned by the API,
+                refreshed in place by :meth:`update`
+        experimental: Experimental features (files, assistive prompt, etc.)
+    """
+
+    #: Unique session identifier.
+    session_id: str
+    #: Server-side session configuration (toolkit/tool allowlists, tags,
+    #: preload, sandbox, manage_connections) as returned by the API. Refreshed
+    #: in place by :meth:`update`.
+    config: ToolRouterSessionConfig
+    #: Experimental capabilities available on this session.
+    experimental: "ToolRouterSessionExperimental"
+    #: Version of the server-side configuration this object last observed.
+    #: Refreshed in place by :meth:`update`. Pass it as ``expected_config_version``
+    #: to make an update conditional.
+    config_version: t.Optional[int]
+
+    def __init__(
+        self,
+        *,
+        client: HttpClient,
+        provider: t.Optional[BaseProvider[t.Any, t.Any]],
+        dangerously_allow_auto_upload_download_files: bool,
+        sensitive_file_upload_protection: bool = True,
+        file_upload_path_deny_segments: t.Optional[t.Sequence[str]] = None,
+        file_upload_dirs: t.Union[t.Sequence[str], t.Literal[False], None] = None,
+        session_id: str,
+        mcp: t.Any,
+        experimental: "ToolRouterSessionExperimental",
+        config: t.Optional[ToolRouterSessionConfig] = None,
+        config_version: t.Optional[int] = None,
+        custom_tools_map: t.Optional[CustomToolsMap] = None,
+        user_id: t.Optional[str] = None,
+        preload: t.Optional[ToolRouterSessionPreloadConfig] = None,
+        preloaded_custom_tool_slugs: t.Optional[t.List[str]] = None,
+        inline_custom_tools_payload: t.Optional[InlineCustomToolsWirePayload] = None,
+    ) -> None:
+        self._init_session(
+            client=client,
+            provider=provider,
+            dangerously_allow_auto_upload_download_files=dangerously_allow_auto_upload_download_files,
+            sensitive_file_upload_protection=sensitive_file_upload_protection,
+            file_upload_path_deny_segments=file_upload_path_deny_segments,
+            file_upload_dirs=file_upload_dirs,
+            session_id=session_id,
+            mcp=mcp,
+            experimental=experimental,
+            config=config,
+            config_version=config_version,
+            custom_tools_map=custom_tools_map,
+            user_id=user_id,
+            preload=preload,
+            preloaded_custom_tool_slugs=preloaded_custom_tool_slugs,
+            inline_custom_tools_payload=inline_custom_tools_payload,
+        )
+
+        # Create singleton session context if custom tools are bound
+        self._session_context: t.Optional[SessionContextImpl] = None
+        if custom_tools_map and user_id:
+            self._session_context = SessionContextImpl(
+                client=client,
+                user_id=user_id,
+                session_id=session_id,
+                custom_tools_map=custom_tools_map,
+                inline_custom_tools_payload=inline_custom_tools_payload,
+            )
+
+    def _tool_router_backend_execute(
+        self,
+        tools_model: t.Any,
+        modifiers: t.Optional["Modifiers"] = None,
+    ) -> t.Callable[..., t.Any]:
+        """Backend execute wrapper with this session's file-upload settings."""
+        return tools_model._wrap_execute_tool_for_tool_router(
+            session_id=self.session_id,
+            modifiers=modifiers,
+            inline_custom_tools_payload=self._inline_custom_tools_payload,
+        )
+
+    def tools(self, modifiers: t.Optional["Modifiers"] = None) -> TToolCollection:
+        """
+        Get provider-wrapped tools for execution with your AI framework.
+
+        Returns tools configured for this session, wrapped in the format expected
+        by your AI provider (OpenAI, Anthropic, LangChain, etc.).
+
+        When custom tools are bound to the session, execution of
+        COMPOSIO_MULTI_EXECUTE_TOOL is intercepted: local tools are executed
+        in-process, remote tools are sent to the backend.
+        """
+        from composio.core.models.tools import Tools as ToolsModel
+        from composio.core.provider import (
+            AgenticProvider,
+            NonAgenticProvider,
+            bind_execution_target,
+        )
+
+        if self._provider is None:
+            raise ValueError(
+                "Provider is required for tool router. "
+                "Please initialize ToolRouter with a provider."
+            )
+
+        tools_model = ToolsModel(
+            client=self._client,
+            provider=self._provider,
+            dangerously_allow_auto_upload_download_files=self._auto_upload_download_files,
+            sensitive_file_upload_protection=self._sensitive_file_upload_protection,
+            file_upload_path_deny_segments=self._file_upload_path_deny_segments,
+            file_upload_dirs=self._file_upload_dirs,
+        )
+
+        router_tools = tools_model.get_raw_tool_router_meta_tools(
+            session_id=self.session_id,
+            modifiers=modifiers,
+        )
+        router_tools = self._add_preloaded_custom_tools(router_tools, modifiers)
+
+        for tool in router_tools:
+            tool.input_parameters = (
+                tools_model._file_helper.enhance_schema_descriptions(
+                    schema=tool.input_parameters,
+                )
+            )
+
+        if issubclass(type(self._provider), NonAgenticProvider):
+            return t.cast(
+                TToolCollection,
+                t.cast(
+                    NonAgenticProvider[TTool, TToolCollection], self._provider
+                ).wrap_tools(tools=router_tools),
+            )
+
+        # For agentic providers: if custom tools are bound, create a routing
+        # execute function that intercepts COMPOSIO_MULTI_EXECUTE_TOOL
+        if self._has_custom_tools():
+            execute_fn = self._create_routing_execute_fn(tools_model, modifiers)
+        else:
+            execute_fn = self._tool_router_backend_execute(
+                tools_model, modifiers=modifiers
+            )
+
+        return t.cast(
+            TToolCollection,
+            t.cast(AgenticProvider[TTool, TToolCollection], self._provider).wrap_tools(
+                tools=router_tools,
+                execute_tool=bind_execution_target(execute_fn, self),
+            ),
+        )
+
+    def _create_routing_execute_fn(
+        self,
+        tools_model: t.Any,
+        modifiers: t.Optional["Modifiers"],
+    ) -> t.Callable[..., t.Any]:
+        """Create an execute function that routes local/remote tools.
+
+        Applies before_execute/after_execute modifiers around the overall
+        COMPOSIO_MULTI_EXECUTE_TOOL call, consistent with the standard path.
+        """
+        backend_execute = self._tool_router_backend_execute(
+            tools_model, modifiers=modifiers
+        )
+
+        def routing_execute(slug: str, arguments: t.Dict) -> t.Dict:
+            if slug == COMPOSIO_MULTI_EXECUTE_TOOL:
+                # Apply before_execute modifiers
+                processed_arguments = arguments
+                if modifiers is not None:
+                    type_before: t.Literal["before_execute"] = "before_execute"
+                    params: ToolExecuteParams = {"arguments": arguments}
+                    modified = apply_modifier_by_type(
+                        modifiers=modifiers,
+                        toolkit="composio",
+                        tool=slug,
+                        type=type_before,
+                        request=params,
+                    )
+                    processed_arguments = modified.get("arguments", arguments)
+
+                result = self._route_multi_execute(processed_arguments, tools_model)
+
+                # Apply after_execute modifiers
+                if modifiers is not None:
+                    type_after: t.Literal["after_execute"] = "after_execute"
+                    result = t.cast(
+                        t.Dict[str, t.Any],
+                        apply_modifier_by_type(
+                            modifiers=modifiers,
+                            toolkit="composio",
+                            tool=slug,
+                            type=type_after,
+                            response=t.cast(ToolExecutionResponse, result),
+                        ),
+                    )
+
+                return result
+            entry = find_custom_tool(self._custom_tools_map, slug)
+            if entry:
+                return t.cast(
+                    t.Dict[str, t.Any],
+                    execute_custom_tool(
+                        entry,
+                        arguments,
+                        t.cast(SessionContextImpl, self._session_context),
+                    ),
+                )
+            assert_unambiguous_custom_tool_slug(self._custom_tools_map, slug)
+            # Non-multi-execute meta tools always go to backend
+            return backend_execute(slug, arguments)
+
+        return routing_execute
+
+    def _route_multi_execute(
+        self,
+        input_args: t.Dict[str, t.Any],
+        tools_model: t.Any,
+    ) -> t.Dict[str, t.Any]:
+        """Route a COMPOSIO_MULTI_EXECUTE_TOOL call.
+
+        Splits the tools[] array into local and remote, executes each
+        appropriately, and merges results in the original request order.
+
+        Modifiers are NOT applied here — the caller (routing_execute)
+        handles before_execute/after_execute to avoid double application.
+        """
+        split = self._split_multi_execute(input_args)
+        if split is None:
+            # Send to backend as-is (no modifiers — caller handles them)
+            return self._tool_router_backend_execute(tools_model)(
+                COMPOSIO_MULTI_EXECUTE_TOOL,
+                input_args,
+            )
+        tool_items, parsed = split.tool_items, split.parsed
+        local_items, remote_indices = split.local_items, split.remote_indices
+
+        ctx = self._session_context
+        assert ctx is not None
+
+        # Determine worker count (capped at MAX_PARALLEL_WORKERS)
+        num_tasks = len(local_items) + (1 if remote_indices else 0)
+        num_workers = min(MAX_PARALLEL_WORKERS, num_tasks)
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            # Submit local tool executions
+            local_futures = []
+            for idx, entry in local_items:
+                future = pool.submit(
+                    execute_custom_tool,
+                    entry,
+                    parsed[idx]["arguments"],
+                    ctx,
+                )
+                local_futures.append((idx, future))
+
+            # Submit remote batch (single call) if any
+            # No modifiers here — the outer routing_execute handles them
+            remote_future = None
+            if remote_indices:
+                remote_tool_items = [tool_items[i] for i in remote_indices]
+                remote_input = {**input_args, "tools": remote_tool_items}
+                execute_fn = self._tool_router_backend_execute(tools_model)
+                remote_future = pool.submit(
+                    execute_fn,
+                    COMPOSIO_MULTI_EXECUTE_TOOL,
+                    remote_input,
+                )
+
+            # Gather local results
+            local_results: t.List[t.Tuple[int, ToolExecutionResponse]] = []
+            for idx, future in local_futures:
+                local_results.append((idx, future.result()))
+
+            # Gather remote result. A transport failure (exception from the
+            # backend call) must not discard completed local results, so it
+            # is captured here and surfaced as per-tool failures below
+            # (matches TS).
+            remote_result: t.Optional[t.Dict[str, t.Any]] = None
+            remote_error_message: t.Optional[str] = None
+            if remote_future:
+                try:
+                    remote_result = remote_future.result()
+                except exceptions.ToolInputRequiredError:
+                    # An input request is not a per-tool failure: re-raise it so
+                    # the caller gets `input_requests` and `request_state`.
+                    # Accepted: local tools in this batch already ran and their results are discarded.
+                    raise
+                except Exception as error:
+                    remote_error_message = str(error) or "Remote tool execution failed"
+
+        return self._merge_multi_execute(
+            split, local_results, remote_result, remote_error_message
+        )
+
+    def authorize(
+        self,
+        toolkit: str,
+        *,
+        callback_url: t.Optional[str] = None,
+        alias: t.Optional[str] = None,
+        experimental: t.Optional[session_link_params.Experimental] = None,
+    ) -> ConnectionRequest:
+        """
+        Authorize a toolkit for the user and get a connection request.
+
+        Initiates the OAuth flow and returns a ConnectionRequest with redirect URL.
+
+        :param alias: Human-readable alias for the connection. Must be unique
+            per userId and toolkit within the project.
+        :param experimental: Experimental options for this connection. Pass an
+            ``Experimental`` dict with ``account_type`` and/or
+            ``acl_config_for_shared`` to create a SHARED connection with a
+            per-user ACL. Experimental — shape may change in future releases.
+        """
+        try:
+            response = self._client.tool_router.session.link(
+                session_id=self.session_id,
+                toolkit=toolkit,
+                callback_url=callback_url if callback_url else omit,
+                alias=alias if alias is not None else omit,
+                experimental=experimental if experimental is not None else omit,
+            )
+        except BadRequestError as error:
+            # The server rejects ACL on PRIVATE connections — surface that
+            # as a typed error mirroring ``composio.connected_accounts.link()``.
+            message = str(error)
+            if ACL_ONLY_FOR_SHARED_ERROR_FRAGMENT in message:
+                raise exceptions.ComposioAclOnlyForSharedError(message) from error
+            raise
+
+        return ConnectionRequest(
+            id=response.connected_account_id,
+            redirect_url=response.redirect_url,
+            status="INITIATED",
+            client=self._client,
+        )
+
+    def toolkits(
+        self,
+        *,
+        toolkits: t.Optional[t.List[str]] = None,
+        next_cursor: t.Optional[str] = None,
+        limit: t.Optional[int] = None,
+        is_connected: t.Optional[bool] = None,
+        search: t.Optional[str] = None,
+    ) -> ToolkitConnectionsDetails:
+        """
+        Get toolkit connection states for the session.
+        """
+        return _toolkit_connections_details(
+            self._client.tool_router.session.toolkits(
+                session_id=self.session_id,
+                **_toolkits_query(
+                    toolkits=toolkits,
+                    next_cursor=next_cursor,
+                    limit=limit,
+                    is_connected=is_connected,
+                    search=search,
+                ),
+            )
+        )
+
+    def search(
+        self,
+        *,
+        query: str,
+        model: t.Optional[str] = None,
+    ) -> ToolRouterSessionSearchResponse:
+        """
+        Search for tools by semantic use case.
+
+        Returns relevant tools for the given query with schemas and guidance.
+        """
+        return self._client.tool_router.session.search(
+            session_id=self.session_id,
+            queries=[{"use_case": query}],
+            model=model if model else omit,
+            experimental=self._inline_custom_tools_payload
+            if self._inline_custom_tools_payload is not None
+            else omit,
+        )
+
+    def execute(
+        self,
+        tool_slug: str,
+        *,
+        arguments: t.Optional[t.Dict[str, t.Any]] = None,
+        account: t.Optional[str] = None,
+        input_responses: t.Optional[t.Dict[str, ToolRouterInputResponse]] = None,
+        request_state: t.Optional[str] = None,
+    ) -> ToolRouterSessionExecuteResponse:
+        """
+        Execute a tool within the session.
+
+        Use ``tool_slug=...`` (not the direct Tools API's ``slug=...``) and
+        ``arguments={...}``. The return value is a Pydantic model: read
+        ``result.result_type == "completed"`` for execution success,
+        ``result.model_dump(mode="json")`` for a JSON-compatible dictionary,
+        or ``result.model_dump_json()`` for a JSON string. Unlike provider
+        helper results and ``after_execute`` modifier dictionaries, it has
+        no ``successful`` key. This call has no model tool-call ID; retain
+        that ID separately when building provider messages.
+
+        For custom tools, accepts the full slug (e.g. "LOCAL_GREP") or the
+        original slug (e.g. "GREP") when that original slug is unique across
+        the session's custom tools and toolkits. Custom tools are executed
+        in-process; remote tools are sent to the Composio backend.
+
+        :param account: Account ID or alias for direct app tool execution in
+            multi-account sessions. Helper/meta tools either ignore this
+            top-level field or define their own account-selection fields.
+        :param input_responses: Experimental. The user's answers to an earlier
+            ``ToolInputRequiredError``, keyed by the IDs in its
+            ``input_requests``. Repeat the same call (same tool and arguments)
+            with them. An approved call runs; a denied or declined one returns
+            ``result_type="failed"``.
+        :param request_state: Experimental. The ``request_state`` of that
+            error, sent back unchanged.
+
+        Both paths return a ``ToolRouterSessionExecuteResponse`` with ``data``,
+        ``error``, ``log_id``, ``result_type``, and ``instant_charge``
+        attributes. ``result_type`` is ``"completed"``, ``"failed"`` or
+        ``"blocked"``; a failed execution can carry a ``None`` or empty
+        ``error``, so read ``result_type`` to tell them apart. A ``"blocked"``
+        call (a session hook blocked it) has empty ``data``, the hook's message
+        in ``error``, and ``block_reason`` (``type`` and ``hook_id``).
+        ``hook_results`` lists every session hook that applied.
+        A log ID correlates an execution; it does not prove that a provider
+        performed a side effect. Inspect the tool-specific ``data`` as well.
+        Transport and authentication errors raise instead of returning an
+        execution result. Handle authentication recovery separately from
+        returned tool failures; retry/idempotency decisions belong to you.
+
+        :raises ToolInputRequiredError: If the tool needs input from the user
+            (for example an approval) before it can run. Nothing was executed.
+        :raises ValidationError: If the API response carries no ``result_type``,
+            or one this SDK does not know.
+        """
+        # Check if this is a local tool (by original or final slug)
+        entry = find_custom_tool(self._custom_tools_map, tool_slug)
+        if entry and self._session_context:
+            return _local_execute_response(
+                execute_custom_tool(entry, arguments or {}, self._session_context)
+            )
+
+        assert_unambiguous_custom_tool_slug(self._custom_tools_map, tool_slug)
+
+        # Disable retries: a session execution is a non-idempotent write, and a
+        # silent retry after a read timeout can duplicate the side effect.
+        return require_execute_result(
+            self._client.without_retries.tool_router.session.execute(
+                session_id=self.session_id,
+                tool_slug=tool_slug,
+                arguments=arguments if arguments is not None else omit,
+                account=account if account is not None else omit,
+                input_responses=(
+                    input_responses if input_responses is not None else omit
+                ),
+                request_state=request_state if request_state is not None else omit,
+                experimental=self._inline_custom_tools_payload
+                if self._inline_custom_tools_payload is not None
+                else omit,
+            ),
+            tool_slug,
+        )
+
+    def execute_meta(
+        self,
+        slug: ToolRouterSessionMetaToolSlug,
+        *,
+        arguments: t.Optional[t.Dict[str, t.Any]] = None,
+        input_responses: t.Optional[t.Dict[str, ToolRouterInputResponse]] = None,
+        request_state: t.Optional[str] = None,
+    ) -> ToolRouterSessionExecuteResponse:
+        """
+        Execute a Composio meta tool (``COMPOSIO_*``) within the session.
+
+        :meth:`execute` also runs meta tools. This method only accepts meta
+        tool slugs, so a typo is a type error instead of a failed request. The
+        call is sent to the Composio backend as is: custom tools named in a
+        ``COMPOSIO_MULTI_EXECUTE_TOOL`` call are not run in-process here.
+
+        :param slug: The meta tool slug to execute.
+        :param arguments: Optional meta tool arguments.
+        :param input_responses: Experimental. The user's answers to an earlier
+            ``ToolInputRequiredError``, keyed by the IDs in its
+            ``input_requests``. Repeat the same call with them, as in :meth:`execute`.
+        :param request_state: Experimental. The ``request_state`` of that
+            error, sent back unchanged.
+        :returns: The tool execution result, in the same shape as
+            :meth:`execute`.
+        :raises ToolInputRequiredError: If the tool needs input from the user
+            (for example an approval) before it can run. Nothing was executed.
+        :raises ValidationError: If the API response carries no ``result_type``,
+            or one this SDK does not know.
+
+        Example:
+            result = session.execute_meta(
+                "COMPOSIO_SEARCH_TOOLS",
+                arguments={"queries": [{"use_case": "send an email"}]},
+            )
+            print(result.result_type, result.data)
+        """
+        # Disable retries: a session execution is a non-idempotent write, and a
+        # silent retry after a read timeout can duplicate the side effect.
+        return require_execute_result(
+            self._client.without_retries.tool_router.session.execute_meta(
+                session_id=self.session_id,
+                slug=slug,
+                arguments=arguments if arguments is not None else omit,
+                input_responses=(
+                    input_responses if input_responses is not None else omit
+                ),
+                request_state=request_state if request_state is not None else omit,
+                experimental=self._inline_custom_tools_payload
+                if self._inline_custom_tools_payload is not None
+                else omit,
+            ),
+            slug,
+        )
 
     def proxy_execute(
         self,
@@ -1364,137 +1640,30 @@ class ToolRouterSession(t.Generic[TTool, TToolCollection]):
         All other parameters use the same types as the generated
         ``client.tool_router.session.patch()`` method.
         """
-        from composio.core.models.tool_router import _session_preload_config
-
-        if sandbox is not omit and workbench is not omit:
-            raise exceptions.InvalidParams(
-                "Pass either `sandbox` or `workbench`, not both. "
-                "`workbench` is a backwards-compatible alias for `sandbox`."
-            )
-        if instant is None:
-            raise exceptions.InvalidParams(
-                "`instant` does not accept None; pass False to disable "
-                "Instant usage, or omit it to keep the stored policy"
-            )
-        if (
-            not isinstance(hooks, Omit)
-            and isinstance(experimental, dict)
-            and experimental.get("session_config_id") is not None
-        ):
-            raise exceptions.InvalidParams(
-                "`hooks` cannot be combined with `experimental={'session_config_id': ...}`; "
-                "a saved Session config sets the session's access policy, so apply "
-                "hooks in a separate update"
-            )
-
-        precondition: t.Union[int, "Omit"]
-        if expected_config_version is None or expected_config_version is False:
-            precondition = omit
-        elif isinstance(expected_config_version, bool) or expected_config_version < 1:
-            raise exceptions.InvalidParams(
-                "`expected_config_version` must be a positive integer, or False to "
-                "send no precondition"
-            )
-        else:
-            precondition = expected_config_version
-
-        workbench_payload = sandbox if sandbox is not omit else workbench
-
-        # The spec does not declare the ``expected_config_version`` precondition
-        # until ComposioHQ/platform#13157 lands, so it travels as an extra root
-        # body field.
-        extra_body: t.Optional[t.Dict[str, t.Any]] = (
-            None
-            if isinstance(precondition, Omit)
-            else {"expected_config_version": precondition}
+        patch, precondition = self._patch_request(
+            toolkits=toolkits,
+            instant=instant,
+            tools=tools,
+            tags=tags,
+            auth_configs=auth_configs,
+            connected_accounts=connected_accounts,
+            manage_connections=manage_connections,
+            sandbox=sandbox,
+            workbench=workbench,
+            multi_account=multi_account,
+            proxy_execute=proxy_execute,
+            hooks=hooks,
+            preload=preload,
+            search=search,
+            execute=execute,
+            experimental=experimental,
+            expected_config_version=expected_config_version,
         )
-
-        # Until ComposioHQ/platform#13157 lands, the spec does not mark every
-        # policy block nullable although the API accepts ``None`` (it removes the
-        # stored override), nor the subfield removals inside
-        # ``manage_connections``, ``multi_account`` and ``experimental``; the
-        # values are serialized as-is.
         try:
-            response = self._client.tool_router.session.patch(
-                session_id=self.session_id,
-                toolkits=t.cast(
-                    t.Union[session_patch_params.Toolkits, "Omit"], toolkits
-                ),
-                tools=t.cast(
-                    t.Union[t.Dict[str, session_patch_params.Tools], "Omit"], tools
-                ),
-                tags=t.cast(t.Union[session_patch_params.Tags, "Omit"], tags),
-                instant=t.cast(
-                    t.Union[
-                        t.Literal[False],
-                        session_patch_params.CurrentInstantVariant1,
-                        "Omit",
-                    ],
-                    instant,
-                ),
-                auth_configs=t.cast(t.Union[t.Dict[str, str], "Omit"], auth_configs),
-                connected_accounts=connected_accounts,
-                manage_connections=t.cast(
-                    t.Union[t.Optional[session_patch_params.ManageConnections], "Omit"],
-                    manage_connections,
-                ),
-                workbench=workbench_payload,
-                multi_account=t.cast(
-                    t.Union[t.Optional[session_patch_params.MultiAccount], "Omit"],
-                    multi_account,
-                ),
-                proxy_execute=(
-                    {"enable": proxy_execute}
-                    if isinstance(proxy_execute, bool)
-                    else proxy_execute
-                ),
-                preload=t.cast(t.Union[session_patch_params.Preload, "Omit"], preload),
-                search=t.cast(t.Union[session_patch_params.Search, "Omit"], search),
-                execute=t.cast(t.Union[session_patch_params.Execute, "Omit"], execute),
-                experimental=t.cast(
-                    t.Union[t.Optional[session_patch_params.Experimental], "Omit"],
-                    experimental,
-                ),
-                hooks=t.cast(
-                    t.Union[
-                        t.Optional[
-                            t.Iterable[
-                                t.Union[
-                                    session_patch_params.CurrentHookVariant0,
-                                    session_patch_params.CurrentHookVariant1,
-                                ]
-                            ]
-                        ],
-                        "Omit",
-                    ],
-                    hooks,
-                ),
-                extra_body=extra_body,
-                # A stale precondition is a deterministic 409: never retry it.
-                request_options={"max_retries": 0},
-            )
+            response = self._client.tool_router.session.patch(**patch)
         except ConflictError as exc:
-            if precondition is omit:
-                message = (
-                    f"Session {self.session_id} configuration changed while this "
-                    "update was in flight; re-fetch the session and retry the update"
-                )
-            else:
-                message = (
-                    f"Session {self.session_id} configuration is no longer at "
-                    f"version {precondition}; re-fetch the session and retry the update"
-                )
-            raise exceptions.SessionConfigConflictError(
-                message,
-                session_id=self.session_id,
-                expected_config_version=(
-                    None if isinstance(precondition, Omit) else precondition
-                ),
-            ) from exc
-        self.config = t.cast(ToolRouterSessionConfig, response.config)
-        self.config_version = response.config_version
-        self.preload = _session_preload_config(response.config.preload)
-        return self.config
+            raise self._patch_conflict(precondition) from exc
+        return self._apply_patch(response)
 
     def list_config_history(
         self,

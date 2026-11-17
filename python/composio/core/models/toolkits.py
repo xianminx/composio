@@ -30,6 +30,40 @@ AuthFieldsT: t.TypeAlias = t.List[
 ]
 
 
+def _latest_auth_config_id(items: t.Sequence[t.Any]) -> t.Optional[str]:
+    """ID of the most recently created auth config, if there is one."""
+    if len(items) == 0:
+        return None
+    (auth_config, *_) = sorted(
+        items,
+        key=lambda x: t.cast(str, x.created_at),
+        reverse=True,
+    )
+    return auth_config.id
+
+
+def _auth_fields(
+    info: toolkit_retrieve_response.ToolkitRetrieveResponse,
+    group: t.Literal["connected_account_initiation", "auth_config_creation"],
+    *,
+    toolkit: str,
+    auth_scheme: AuthSchemeL,
+    required_only: bool,
+) -> AuthFieldsT:
+    for auth_detail in info.auth_config_details or []:
+        if auth_detail.mode != auth_scheme:
+            continue
+
+        fields = getattr(auth_detail.fields, group)
+        if required_only:
+            return t.cast(AuthFieldsT, fields.required)
+        return t.cast(AuthFieldsT, fields.required + fields.optional)
+
+    raise exceptions.InvalidParams(
+        f"auth config details not found with {toolkit=} and {auth_scheme=}"
+    )
+
+
 class Toolkits(Resource):
     """
     Toolkits are a collectiono of tools that can be used to perform various tasks.
@@ -207,13 +241,9 @@ class Toolkits(Resource):
     def _get_auth_config_id(self, toolkit: str) -> str:
         """Get the auth config ID for a toolkit."""
         auth_configs = self._client.auth_configs.list(toolkit_slug=toolkit)
-        if len(auth_configs.items) > 0:
-            (auth_config, *_) = sorted(
-                auth_configs.items,
-                key=lambda x: t.cast(str, x.created_at),
-                reverse=True,
-            )
-            return auth_config.id
+        existing = _latest_auth_config_id(auth_configs.items)
+        if existing is not None:
+            return existing
 
         return self._client.auth_configs.create(
             toolkit={"slug": toolkit},
@@ -251,25 +281,12 @@ class Toolkits(Resource):
         """
         Get the required property for a given toolkit and auth scheme.
         """
-        details = self._client.toolkits.retrieve(slug=toolkit).auth_config_details or []
-        for auth_detail in details:
-            if auth_detail.mode != auth_scheme:
-                continue
-
-            if required_only:
-                return t.cast(
-                    AuthFieldsT,
-                    auth_detail.fields.connected_account_initiation.required,
-                )
-
-            return t.cast(
-                AuthFieldsT,
-                auth_detail.fields.connected_account_initiation.required
-                + auth_detail.fields.connected_account_initiation.optional,
-            )
-
-        raise exceptions.InvalidParams(
-            f"auth config details not found with {toolkit=} and {auth_scheme=}"
+        return _auth_fields(
+            self._client.toolkits.retrieve(slug=toolkit),
+            "connected_account_initiation",
+            toolkit=toolkit,
+            auth_scheme=auth_scheme,
+            required_only=required_only,
         )
 
     def get_auth_config_creation_fields(
@@ -281,23 +298,10 @@ class Toolkits(Resource):
         """
         Get the required property for a given toolkit and auth scheme.
         """
-        info = self._client.toolkits.retrieve(slug=toolkit)
-        for auth_detail in info.auth_config_details or []:
-            if auth_detail.mode != auth_scheme:
-                continue
-
-            if required_only:
-                return t.cast(
-                    AuthFieldsT,
-                    auth_detail.fields.auth_config_creation.required,
-                )
-
-            return t.cast(
-                AuthFieldsT,
-                auth_detail.fields.auth_config_creation.required
-                + auth_detail.fields.auth_config_creation.optional,
-            )
-
-        raise exceptions.InvalidParams(
-            f"auth config details not found with {toolkit=} and {auth_scheme=}"
+        return _auth_fields(
+            self._client.toolkits.retrieve(slug=toolkit),
+            "auth_config_creation",
+            toolkit=toolkit,
+            auth_scheme=auth_scheme,
+            required_only=required_only,
         )

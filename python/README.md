@@ -114,6 +114,39 @@ print(result.final_output)
 
 Other Python providers: [`composio-openai`](https://github.com/ComposioHQ/composio/tree/next/python/providers/openai), [`composio-anthropic`](https://github.com/ComposioHQ/composio/tree/next/python/providers/anthropic), [`composio-claude-agent-sdk`](https://github.com/ComposioHQ/composio/tree/next/python/providers/claude_agent_sdk), [`composio-langchain`](https://github.com/ComposioHQ/composio/tree/next/python/providers/langchain), [`composio-langgraph`](https://github.com/ComposioHQ/composio/tree/next/python/providers/langgraph), [`composio-llamaindex`](https://github.com/ComposioHQ/composio/tree/next/python/providers/llamaindex), [`composio-crewai`](https://github.com/ComposioHQ/composio/tree/next/python/providers/crewai), [`composio-autogen`](https://github.com/ComposioHQ/composio/tree/next/python/providers/autogen), [`composio-gemini`](https://github.com/ComposioHQ/composio/tree/next/python/providers/gemini), [`composio-google`](https://github.com/ComposioHQ/composio/tree/next/python/providers/google), [`composio-google-adk`](https://github.com/ComposioHQ/composio/tree/next/python/providers/google_adk). Don't see yours? [Build a custom provider](https://docs.composio.dev/docs/providers/custom-providers).
 
+## Async
+
+`AsyncComposio` is the same SDK for `asyncio`. Every method that calls the Composio API is a coroutine, and requests go over one `httpx.AsyncClient`. It takes the arguments `Composio` takes and reads the same environment variables.
+
+```python
+import asyncio
+
+from composio import AsyncComposio
+
+
+async def main() -> None:
+    async with AsyncComposio() as composio:
+        session = await composio.create(user_id="user_123")
+        tools = await session.tools()
+
+        result = await composio.tools.execute(
+            "GITHUB_GET_THE_AUTHENTICATED_USER",
+            {},
+            user_id="user_123",
+            dangerously_skip_version_check=True,
+        )
+        print(result["successful"])
+
+
+asyncio.run(main())
+```
+
+Three parts run off the event loop instead of on it, so none of them block it:
+
+- File bytes sent to or fetched from a presigned or third-party URL use the SDK's SSRF-guarded transfer code on a worker thread.
+- The realtime trigger connection runs on its own thread and delivers events to your handlers on the event loop. Handlers can be coroutines.
+- Tools wrapped for an agent framework, and custom tools, are synchronous callbacks that wait for the event loop to run the call, so they must run off the loop thread. The OpenAI Agents, Claude Agent SDK, and AutoGen providers already run tools on a worker thread. A framework that calls a synchronous tool inline on the event loop gets `SyncCallOnEventLoopError`.
+
 ## MCP
 
 Every session also exposes a hosted MCP endpoint. Pass `mcp=True` and point Claude, Cursor, or any MCP client at it:

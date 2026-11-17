@@ -6,10 +6,21 @@ from .agentic import (
     bind_execution_target,
     get_execution_target,
 )
-from .base import TTool, TToolCollection, ToolCallExecutionTarget, ToolCallSession
+from .base import (
+    AsyncExecuteToolFn,
+    AsyncToolCallExecutionTarget,
+    AsyncToolCallSession,
+    TTool,
+    TToolCollection,
+    ToolCallExecutionTarget,
+    ToolCallSession,
+)
 from .none_agentic import NonAgenticProvider
 
 __all__ = [
+    "AsyncExecuteToolFn",
+    "AsyncToolCallExecutionTarget",
+    "AsyncToolCallSession",
     "TTool",
     "TToolCollection",
     "ToolCallExecutionTarget",

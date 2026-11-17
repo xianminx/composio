@@ -30,9 +30,13 @@ from .core.types import (
     ToolkitVersionParam,
     ToolkitVersions,
 )
+from .core.models._async.tool_router_session_files import AsyncRemoteFile
 from .sdk import Composio
+from .sdk_async import AsyncComposio
 
 __all__ = (
+    "AsyncComposio",
+    "AsyncRemoteFile",
     "Composio",
     "ComposioDeprecationWarning",
     "CustomTool",

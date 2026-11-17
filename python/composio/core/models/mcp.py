@@ -119,6 +119,99 @@ _MANAGED_AUTH_DEPRECATION = (
 _managed_auth_deprecation_warned = False
 
 
+def _toolkit_names_and_auth_config_ids(
+    toolkits: t.Sequence[t.Union[ConfigToolkit, str]],
+) -> t.Tuple[t.List[str], t.List[str]]:
+    """Unique toolkit slugs and auth config IDs, in first-seen order."""
+    toolkit_names: t.List[str] = []
+    auth_config_ids: t.List[str] = []
+    for toolkit in toolkits:
+        toolkit_config = (
+            ConfigToolkit(toolkit=toolkit) if isinstance(toolkit, str) else toolkit
+        )
+        if (
+            "toolkit" in toolkit_config
+            and toolkit_config["toolkit"] not in toolkit_names
+        ):
+            toolkit_names.append(toolkit_config["toolkit"])
+
+        if (
+            "auth_config_id" in toolkit_config
+            and toolkit_config["auth_config_id"] not in auth_config_ids
+        ):
+            auth_config_ids.append(toolkit_config["auth_config_id"])
+    return toolkit_names, auth_config_ids
+
+
+def _update_params(
+    name: t.Optional[str],
+    toolkits: t.Optional[t.List[t.Union[ConfigToolkit, str]]],
+    manually_manage_connections: t.Optional[bool],
+    allowed_tools: t.Optional[t.List[str]],
+) -> t.Dict[str, t.Any]:
+    update_params: t.Dict[str, t.Any] = {}
+
+    if name is not None:
+        update_params["name"] = name
+
+    if toolkits is not None:
+        toolkit_names, auth_config_ids = _toolkit_names_and_auth_config_ids(toolkits)
+        update_params["toolkits"] = toolkit_names
+        update_params["auth_config_ids"] = auth_config_ids
+
+    if allowed_tools is not None:
+        # The update endpoint only reads `allowed_tools`; the create-time
+        # `custom_tools` alias is deprecated and ignored on PATCH.
+        update_params["allowed_tools"] = allowed_tools
+
+    if manually_manage_connections is not None:
+        update_params["managed_auth_via_composio"] = not manually_manage_connections
+
+    return update_params
+
+
+def _list_response(response: t.Any, page_no: t.Optional[int]) -> MCPListResponse:
+    items = response.items if hasattr(response, "items") and response.items else []
+
+    return MCPListResponse(
+        items=items,
+        current_page=getattr(response, "current_page", page_no or 1),
+        total_pages=getattr(response, "total_pages", 1),
+    )
+
+
+def _managed_auth_by_composio(manually_manage_connections: t.Optional[bool]) -> bool:
+    """Whether to send ``managed_auth_by_composio``, warning once when it is sent."""
+    managed_auth_by_composio = not manually_manage_connections
+    global _managed_auth_deprecation_warned
+    if managed_auth_by_composio and not _managed_auth_deprecation_warned:
+        _managed_auth_deprecation_warned = True
+        # 4: past ``generate`` and the resource's trace wrapper to the caller's line.
+        warnings.warn(
+            _MANAGED_AUTH_DEPRECATION, ComposioDeprecationWarning, stacklevel=4
+        )
+    return managed_auth_by_composio
+
+
+def _server_instance(
+    server_details: t.Any, url_response: t.Any, user_id: str
+) -> MCPServerInstance:
+    if hasattr(url_response, "user_ids_url") and url_response.user_ids_url:
+        server_url = url_response.user_ids_url[0]
+    else:
+        raise ValidationError("No server URL generated")
+
+    return {
+        "id": server_details.id,
+        "name": server_details.name,
+        "type": "streamable_http",
+        "url": server_url,
+        "user_id": user_id,
+        "allowed_tools": getattr(server_details, "allowed_tools", []),
+        "auth_configs": getattr(server_details, "auth_config_ids", []),
+    }
+
+
 class MCP(Resource):
     """
     MCP (Model Control Protocol) class.
@@ -201,35 +294,9 @@ class MCP(Resource):
             raise ValidationError("At least one toolkit configuration is required")
 
         try:
-            # Normalize toolkits to MCPToolkitConfig format
-            normalized_toolkit_configs: t.List[ConfigToolkit] = []
-            for toolkit in toolkits:
-                if isinstance(toolkit, str):
-                    # Convert string to MCPToolkitConfig
-                    normalized_toolkit_configs.append(ConfigToolkit(toolkit=toolkit))
-                else:
-                    # Already MCPToolkitConfig, use as-is
-                    normalized_toolkit_configs.append(toolkit)
-
-            # Extract toolkits and prepare for API call
-            toolkit_configs = normalized_toolkit_configs
-
-            # Get unique toolkits and auth config IDs
-            toolkit_names = []
-            auth_config_ids = []
-
-            for toolkit_config in toolkit_configs:
-                if (
-                    "toolkit" in toolkit_config
-                    and toolkit_config["toolkit"] not in toolkit_names
-                ):
-                    toolkit_names.append(toolkit_config["toolkit"])
-
-                if (
-                    "auth_config_id" in toolkit_config
-                    and toolkit_config["auth_config_id"] not in auth_config_ids
-                ):
-                    auth_config_ids.append(toolkit_config["auth_config_id"])
+            toolkit_names, auth_config_ids = _toolkit_names_and_auth_config_ids(
+                toolkits
+            )
 
             # Use the allowed_tools parameter instead of individual toolkit configs
             # (`custom_tools` is the deprecated create-time alias)
@@ -295,15 +362,7 @@ class MCP(Resource):
                 order_direction=none_to_omit(order_direction),
             )
 
-            items = (
-                response.items if hasattr(response, "items") and response.items else []
-            )
-
-            return MCPListResponse(
-                items=items,
-                current_page=getattr(response, "current_page", page_no or 1),
-                total_pages=getattr(response, "total_pages", 1),
-            )
+            return _list_response(response, page_no)
 
         except Exception as e:
             raise ValidationError("Failed to list MCP servers") from e
@@ -375,53 +434,9 @@ class MCP(Resource):
             ... )
         """
         try:
-            update_params: t.Dict[str, t.Any] = {}
-
-            if name is not None:
-                update_params["name"] = name
-
-            if toolkits is not None:
-                # Normalize toolkits to ConfigToolkit format (same as create method)
-                normalized_toolkit_configs: t.List[ConfigToolkit] = []
-                for toolkit in toolkits:
-                    if isinstance(toolkit, str):
-                        # Convert string to ConfigToolkit
-                        normalized_toolkit_configs.append(
-                            ConfigToolkit(toolkit=toolkit)
-                        )
-                    else:
-                        # Already ConfigToolkit, use as-is
-                        normalized_toolkit_configs.append(toolkit)
-
-                # Extract toolkits and prepare for API call
-                toolkit_names = []
-                auth_config_ids = []
-
-                for toolkit_config in normalized_toolkit_configs:
-                    if (
-                        "toolkit" in toolkit_config
-                        and toolkit_config["toolkit"] not in toolkit_names
-                    ):
-                        toolkit_names.append(toolkit_config["toolkit"])
-
-                    if (
-                        "auth_config_id" in toolkit_config
-                        and toolkit_config["auth_config_id"] not in auth_config_ids
-                    ):
-                        auth_config_ids.append(toolkit_config["auth_config_id"])
-
-                update_params["toolkits"] = toolkit_names
-                update_params["auth_config_ids"] = auth_config_ids
-
-            if allowed_tools is not None:
-                # The update endpoint only reads `allowed_tools`; the create-time
-                # `custom_tools` alias is deprecated and ignored on PATCH.
-                update_params["allowed_tools"] = allowed_tools
-
-            if manually_manage_connections is not None:
-                update_params[
-                    "managed_auth_via_composio"
-                ] = not manually_manage_connections
+            update_params = _update_params(
+                name, toolkits, manually_manage_connections, allowed_tools
+            )
 
             # Use the MCP update endpoint
             response = self._client.mcp.update(server_id, **update_params)
@@ -490,14 +505,9 @@ class MCP(Resource):
             server_details = self._client.mcp.retrieve(mcp_config_id)
 
             # Generate server URLs (matching TS: this.client.mcp.generate.url)
-            managed_auth_by_composio = not manually_manage_connections
-            global _managed_auth_deprecation_warned
-            if managed_auth_by_composio and not _managed_auth_deprecation_warned:
-                _managed_auth_deprecation_warned = True
-                # 3: past ``Resource``'s trace wrapper to the caller's line.
-                warnings.warn(
-                    _MANAGED_AUTH_DEPRECATION, ComposioDeprecationWarning, stacklevel=3
-                )
+            managed_auth_by_composio = _managed_auth_by_composio(
+                manually_manage_connections
+            )
             # The API defaults the field to false, so opting out omits it and
             # raises no client notice.
             url_response = self._client.mcp.generate.url(
@@ -506,24 +516,7 @@ class MCP(Resource):
                 managed_auth_by_composio=True if managed_auth_by_composio else omit,
             )
 
-            # Get the generated URL (matching TS: urlResponse.user_ids_url[0])
-            if hasattr(url_response, "user_ids_url") and url_response.user_ids_url:
-                server_url = url_response.user_ids_url[0]
-            else:
-                raise ValidationError("No server URL generated")
-
-            # Create structured server instance (matching TS MCPServerInstance)
-            server_instance: MCPServerInstance = {
-                "id": server_details.id,
-                "name": server_details.name,
-                "type": "streamable_http",
-                "url": server_url,
-                "user_id": user_id,
-                "allowed_tools": getattr(server_details, "allowed_tools", []),
-                "auth_configs": getattr(server_details, "auth_config_ids", []),
-            }
-
-            return server_instance
+            return _server_instance(server_details, url_response, user_id)
 
         except Exception as e:
             if isinstance(e, ValidationError):

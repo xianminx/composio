@@ -14,7 +14,11 @@ from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
 from openai.types.shared_params.function_parameters import FunctionParameters
 
-from composio.core.provider import NonAgenticProvider, ToolCallSession
+from composio.core.provider import (
+    AsyncToolCallSession,
+    NonAgenticProvider,
+    ToolCallSession,
+)
 from composio.types import Modifiers, Tool, ToolExecutionResponse
 from composio.utils.shared import normalize_tool_arguments
 
@@ -120,6 +124,30 @@ class OpenAIProvider(
         :param session: Tool Router session that produced session tools.
         :return: A list of output objects from the function calls.
         """
+        outputs = []
+        for call in self._tool_calls_to_handle(response, user_id, session, modifiers):
+            result = (
+                self.execute_tool_call(
+                    session=session,
+                    tool_call=call,
+                )
+                if session is not None
+                else self.execute_tool_call(
+                    user_id=t.cast(str, user_id),
+                    tool_call=call,
+                    modifiers=modifiers,
+                )
+            )
+            outputs.append(result)
+        return outputs
+
+    def _tool_calls_to_handle(
+        self,
+        response: t.Optional[ChatCompletion],
+        user_id: t.Optional[str],
+        session: t.Optional[t.Any],
+        modifiers: t.Optional[Modifiers],
+    ) -> t.List[ChatCompletionMessageToolCall]:
         if response is None:
             raise TypeError("response is required")
         self.resolve_tool_call_execution_target(user_id=user_id, session=session)
@@ -127,7 +155,6 @@ class OpenAIProvider(
             raise ValueError(
                 "Direct execution modifiers cannot be used with a Tool Router session"
             )
-        outputs = []
         # Only the first choice is actionable: its tool results feed back into a
         # single assistant turn. With n > 1, iterating every choice would run each
         # tool call once per choice and orphan the tool_call_ids belonging to the
@@ -135,20 +162,51 @@ class OpenAIProvider(
         choice = response.choices[0] if response.choices else None
         # A single assistant message can carry several tool calls (parallel tool
         # calls, on by default); each one needs its own tool result.
-        if choice is not None and choice.message.tool_calls is not None:
-            for tool_call in choice.message.tool_calls:
-                call = t.cast(ChatCompletionMessageToolCall, tool_call)
-                result = (
-                    self.execute_tool_call(
-                        session=session,
-                        tool_call=call,
-                    )
-                    if session is not None
-                    else self.execute_tool_call(
-                        user_id=t.cast(str, user_id),
-                        tool_call=call,
-                        modifiers=modifiers,
-                    )
-                )
-                outputs.append(result)
-        return outputs
+        if choice is None or choice.message.tool_calls is None:
+            return []
+        return [
+            t.cast(ChatCompletionMessageToolCall, tool_call)
+            for tool_call in choice.message.tool_calls
+        ]
+
+    async def aexecute_tool_call(
+        self,
+        user_id: t.Optional[str] = None,
+        tool_call: t.Optional[ChatCompletionMessageToolCall] = None,
+        modifiers: t.Optional[Modifiers] = None,
+        *,
+        session: t.Optional[AsyncToolCallSession] = None,
+    ) -> ToolExecutionResponse:
+        """See :meth:`execute_tool_call`; for use with ``AsyncComposio``."""
+        if tool_call is None:
+            raise TypeError("tool_call is required")
+        target = self.resolve_tool_call_execution_target(
+            user_id=user_id, session=session
+        )
+        return await self.aexecute_tool_for_target(
+            target=target,
+            slug=tool_call.function.name,
+            arguments=normalize_tool_arguments(tool_call.function.arguments),
+            modifiers=modifiers,
+        )
+
+    async def ahandle_tool_calls(
+        self,
+        user_id: t.Optional[str] = None,
+        response: t.Optional[ChatCompletion] = None,
+        modifiers: t.Optional[Modifiers] = None,
+        *,
+        session: t.Optional[AsyncToolCallSession] = None,
+    ) -> t.List[ToolExecutionResponse]:
+        """See :meth:`handle_tool_calls`; for use with ``AsyncComposio``.
+
+        Tool calls run one after another, in the order the model emitted them.
+        """
+        return [
+            await self.aexecute_tool_call(
+                user_id=user_id, tool_call=call, modifiers=modifiers, session=session
+            )
+            for call in self._tool_calls_to_handle(
+                response, user_id, session, modifiers
+            )
+        ]

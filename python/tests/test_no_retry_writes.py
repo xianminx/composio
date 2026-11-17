@@ -18,9 +18,10 @@ from unittest.mock import Mock, patch
 import httpx
 import pytest
 from composio_client import DEFAULT_MAX_RETRIES, APIError, ProjectAuth
+from composio_client import AsyncComposio as AsyncBaseComposio
 from composio_client import Composio as BaseComposio
 
-from composio.client import HttpClient
+from composio.client import AsyncHttpClient, HttpClient, _SDKClientMixin
 from composio.core.models.base import allow_tracking
 from composio.core.models.session_context import SessionContextImpl
 from composio.core.models.tool_router_session import ToolRouterSession
@@ -123,7 +124,17 @@ class TestBaseWithOptionsContract:
         assert "_extra_kwargs" in inspect.signature(base_with_options).parameters
 
     def test_with_options_is_overridden(self) -> None:
-        assert "with_options" in HttpClient.__dict__
+        # The override lives on the mixin both clients share, ahead of the
+        # generated client in each MRO.
+        for client_class, base in (
+            (HttpClient, BaseComposio),
+            (AsyncHttpClient, AsyncBaseComposio),
+        ):
+            assert (
+                "_extra_kwargs"
+                in inspect.signature(base.__dict__["with_options"]).parameters
+            )
+            assert client_class.with_options is _SDKClientMixin.with_options
 
 
 class TestWritePathDoesNotRetry:
