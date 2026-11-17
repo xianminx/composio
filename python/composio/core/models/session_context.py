@@ -42,8 +42,7 @@ _VALID_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH"})
 _VALID_PARAM_TYPES = frozenset({"header", "query"})
 
 
-def proxy_execute_impl(
-    client: HttpClient,
+def proxy_execute_request(
     session_id: str,
     *,
     toolkit: str,
@@ -51,12 +50,9 @@ def proxy_execute_impl(
     method: t.Literal["GET", "POST", "PUT", "DELETE", "PATCH"],
     body: t.Any = None,
     parameters: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
-) -> ToolRouterSessionProxyExecuteResponse:
-    """Shared proxy execute implementation used by SessionContextImpl and ToolRouterSession.
-
-    Projects the generated client's response model onto the SDK's own shape so
-    the public return type does not move when the client is regenerated.
-    """
+) -> t.Tuple[t.Dict[str, t.Any], str]:
+    """Validate a proxy call; return the ``session.proxy_execute`` keyword
+    arguments and the subject its errors name."""
     # Client-side validation (matches TS SessionProxyExecuteParamsSchema)
     if not toolkit:
         raise ValidationError("proxy_execute: toolkit is required")
@@ -90,17 +86,24 @@ def proxy_execute_impl(
             )
 
     subject = f"{method} proxy call for toolkit {toolkit}"
-    # Disable retries: a proxied call is a non-idempotent write, and a silent
-    # retry after a read timeout can duplicate the side effect.
-    raw = client.without_retries.tool_router.session.proxy_execute(
-        session_id=session_id,
-        toolkit_slug=toolkit,
-        endpoint=endpoint,
-        method=method,
-        body=body if body is not None else omit,
-        parameters=api_params if api_params else omit,
+    return (
+        dict(
+            session_id=session_id,
+            toolkit_slug=toolkit,
+            endpoint=endpoint,
+            method=method,
+            body=body if body is not None else omit,
+            parameters=api_params if api_params else omit,
+        ),
+        subject,
     )
 
+
+def proxy_execute_result(
+    raw: t.Any, subject: str
+) -> ToolRouterSessionProxyExecuteResponse:
+    """Project the generated client's response model onto the SDK's own shape,
+    so the public return type does not move when the client is regenerated."""
     # A blocked request has no HTTP response, so it is read before ``status``.
     if isinstance(raw, SessionProxyExecuteBlockedResponse):
         blocked_result: ToolRouterSessionProxyExecuteBlocked = {
@@ -138,6 +141,32 @@ def proxy_execute_impl(
             "expires_at": binary_data.expires_at,
         }
     return result
+
+
+def proxy_execute_impl(
+    client: HttpClient,
+    session_id: str,
+    *,
+    toolkit: str,
+    endpoint: str,
+    method: t.Literal["GET", "POST", "PUT", "DELETE", "PATCH"],
+    body: t.Any = None,
+    parameters: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
+) -> ToolRouterSessionProxyExecuteResponse:
+    """Shared proxy execute implementation used by SessionContextImpl and ToolRouterSession."""
+    request, subject = proxy_execute_request(
+        session_id,
+        toolkit=toolkit,
+        endpoint=endpoint,
+        method=method,
+        body=body,
+        parameters=parameters,
+    )
+    # Disable retries: a proxied call is a non-idempotent write, and a silent
+    # retry after a read timeout can duplicate the side effect.
+    return proxy_execute_result(
+        client.without_retries.tool_router.session.proxy_execute(**request), subject
+    )
 
 
 class SessionContextImpl:
@@ -194,18 +223,28 @@ class SessionContextImpl:
         assert_unambiguous_custom_tool_slug(self._custom_tools_map, tool_slug)
 
         # Serialize any Pydantic model instances before sending to remote API
-        serialized = _serialize_arguments(arguments)
+        return self._remote_execute(tool_slug, _serialize_arguments(arguments))
 
+    def _remote_execute_request(
+        self, tool_slug: str, serialized: t.Dict[str, t.Any]
+    ) -> t.Dict[str, t.Any]:
+        return dict(
+            session_id=self._session_id,
+            tool_slug=tool_slug,
+            arguments=serialized,
+            experimental=self._inline_custom_tools_payload
+            if self._inline_custom_tools_payload is not None
+            else omit,
+        )
+
+    def _remote_execute(
+        self, tool_slug: str, serialized: t.Dict[str, t.Any]
+    ) -> SessionExecuteResponse:
         # Disable retries: a session execution is a non-idempotent write, and a
         # silent retry after a read timeout can duplicate the side effect.
         return require_execute_result(
             self._client.without_retries.tool_router.session.execute(
-                session_id=self._session_id,
-                tool_slug=tool_slug,
-                arguments=serialized,
-                experimental=self._inline_custom_tools_payload
-                if self._inline_custom_tools_payload is not None
-                else omit,
+                **self._remote_execute_request(tool_slug, serialized)
             ),
             tool_slug,
         )

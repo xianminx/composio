@@ -72,6 +72,26 @@ def _retry_after_seconds(error: RateLimitError) -> float:
     return max(0.0, seconds) if math.isfinite(seconds) else 0.0
 
 
+def _raise_if_terminal(id: str, status: str) -> None:
+    if status in _TERMINAL_CONNECTION_STATES:
+        raise exceptions.SDKError(
+            message=(
+                f"Connection {id} entered terminal state "
+                f"{status!r} before becoming active"
+            ),
+        )
+
+
+def _wait_timeout_error(id: str) -> exceptions.ComposioSDKTimeoutError:
+    return exceptions.ComposioSDKTimeoutError(
+        message=f"Timeout while waiting for connection {id} to be active",
+    )
+
+
+def _next_poll_delay(poll_delay: float) -> float:
+    return min(poll_delay * _POLL_DELAY_GROWTH, _MAX_POLL_DELAY_SECONDS)
+
+
 class ConnectionRequest(Resource):
     """
     A connection request.
@@ -133,13 +153,7 @@ class ConnectionRequest(Resource):
                 self.status = connection.status
                 if self.status == "ACTIVE":
                     return connection
-                if self.status in _TERMINAL_CONNECTION_STATES:
-                    raise exceptions.SDKError(
-                        message=(
-                            f"Connection {self.id} entered terminal state "
-                            f"{self.status!r} before becoming active"
-                        ),
-                    )
+                _raise_if_terminal(self.id, self.status)
 
             remaining = deadline - time.time()
             # Written so a NaN timeout times out rather than polling forever.
@@ -149,11 +163,9 @@ class ConnectionRequest(Resource):
             # Don't start a fresh client retry cycle after a rate-limited wait expires.
             if rate_limited and time.time() >= deadline:
                 break
-            poll_delay = min(poll_delay * _POLL_DELAY_GROWTH, _MAX_POLL_DELAY_SECONDS)
+            poll_delay = _next_poll_delay(poll_delay)
 
-        raise exceptions.ComposioSDKTimeoutError(
-            message=f"Timeout while waiting for connection {self.id} to be active",
-        )
+        raise _wait_timeout_error(self.id)
 
     @classmethod
     def from_id(cls, id: str, client: HttpClient) -> te.Self:
@@ -397,6 +409,151 @@ class AuthScheme:
         )
 
 
+def _refresh_params(params: t.Mapping[str, t.Any]) -> t.Dict[str, t.Any]:
+    """Warn about the deprecated refresh and drop ``validate_credentials``.
+
+    The API no longer accepts it; every other kwarg (timeout, extra_headers,
+    ...) is forwarded unchanged. Warnings point at the caller of ``refresh``.
+    """
+    warnings.warn(
+        _REFRESH_DEPRECATION, exceptions.ComposioDeprecationWarning, stacklevel=3
+    )
+    forwarded: t.Dict[str, t.Any] = dict(params)
+    if forwarded.pop("validate_credentials", None) is not None:
+        warnings.warn(
+            _REFRESH_VALIDATE_CREDENTIALS_IGNORED,
+            exceptions.ComposioDeprecationWarning,
+            stacklevel=3,
+        )
+    return forwarded
+
+
+def _revoke_error(nanoid: str, error: Exception) -> Exception:
+    if isinstance(error, BadRequestError):
+        return exceptions.ComposioConnectedAccountRevocationNotSupportedError(
+            f"Connected account {nanoid!r} cannot be revoked programmatically: "
+            f"the toolkit does not support token revocation ({error})"
+        )
+    return exceptions.ComposioConnectedAccountNotRevokableError(
+        f"Connected account {nanoid!r} is not in a revokable state ({error})"
+    )
+
+
+def _acl_payload(
+    allow_all_users: t.Optional[bool],
+    allowed_user_ids: t.Optional[t.List[str]],
+    not_allowed_user_ids: t.Optional[t.List[str]],
+) -> connected_account_patch_params.Experimental:
+    if (
+        allow_all_users is None
+        and allowed_user_ids is None
+        and not_allowed_user_ids is None
+    ):
+        raise exceptions.ValidationError(
+            "update_acl requires at least one of allow_all_users, "
+            "allowed_user_ids, or not_allowed_user_ids"
+        )
+
+    acl: t.Dict[str, t.Any] = {}
+    if allow_all_users is not None:
+        acl["allow_all_users"] = allow_all_users
+    if allowed_user_ids is not None:
+        acl["allowed_user_ids"] = allowed_user_ids
+    if not_allowed_user_ids is not None:
+        acl["not_allowed_user_ids"] = not_allowed_user_ids
+    return {
+        "acl_config_for_shared": t.cast(
+            connected_account_patch_params.ExperimentalACLConfigForShared,
+            acl,
+        ),
+    }
+
+
+def _raise_acl_only_for_shared(error: BadRequestError) -> None:
+    """Surface the server's ACL-on-PRIVATE rejection as a typed error."""
+    message = str(error)
+    if ACL_ONLY_FOR_SHARED_ERROR_FRAGMENT in message:
+        raise exceptions.ComposioAclOnlyForSharedError(message) from error
+
+
+def _guard_multiple_accounts(
+    items: t.Sequence[t.Any],
+    *,
+    user_id: str,
+    auth_config_id: str,
+    allow_multiple: bool,
+) -> None:
+    if items and not allow_multiple:
+        raise exceptions.ComposioMultipleConnectedAccountsError(
+            f"Multiple connected accounts found for user {user_id} in auth config {auth_config_id}. "
+            "Please use the allow_multiple option to allow multiple connected accounts."
+        )
+    elif items:
+        logger.warning(
+            "[Warn:AllowMultiple] Multiple connected accounts found for user %s in auth config %s",
+            user_id,
+            auth_config_id,
+        )
+
+
+def _initiate_connection(
+    user_id: str,
+    callback_url: t.Optional[str],
+    config: t.Optional[connected_account_create_params.ConnectionState],
+    alias: t.Optional[str],
+) -> connected_account_create_params.Connection:
+    connection: dict[str, t.Any] = {"user_id": user_id}
+    if callback_url is not None:
+        connection["callback_url"] = callback_url
+    if config is not None:
+        connection["state"] = config
+    if alias is not None:
+        connection["alias"] = alias
+    return t.cast(connected_account_create_params.Connection, connection)
+
+
+def _deprecation_header(raw: t.Any) -> t.Optional[str]:
+    headers = getattr(raw, "headers", None)
+    if headers is not None and hasattr(headers, "get"):
+        value = headers.get("Deprecation") or headers.get("deprecation")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _raise_legacy_endpoint_retired(error: BadRequestError) -> None:
+    """Surface the retired legacy endpoint's 400 as a typed, actionable error."""
+    message = str(error)
+    if (
+        "no longer supported" in message
+        and "/api/v3/connected_accounts/link" in message
+    ):
+        raise exceptions.ComposioLegacyConnectedAccountsEndpointRetiredError(
+            message
+        ) from error
+
+
+def _warn_legacy_initiate(deprecation_header: t.Optional[str]) -> None:
+    """Warn once per process when the response is on the retiring path.
+
+    Header presence is a 1:1 signal: custom auth configs and non-OAuth schemes
+    get a clean response and stay silent. Points at the caller of ``initiate``.
+    """
+    global _legacy_initiate_warning_emitted
+    if not _legacy_initiate_warning_emitted and deprecation_header:
+        _legacy_initiate_warning_emitted = True
+        warnings.warn(
+            "composio.connected_accounts.initiate() will stop working "
+            "for this auth config on or before 2026-07-03 (see Sunset "
+            "header on the response). Switch to "
+            "composio.connected_accounts.link() — same return shape, "
+            "same allow_multiple semantics. "
+            "https://docs.composio.dev/docs/changelog/2026/04/24",
+            exceptions.ComposioDeprecationWarning,
+            stacklevel=3,
+        )
+
+
 class ConnectedAccounts:
     """
     Manage connected accounts.
@@ -459,19 +616,9 @@ class ConnectedAccounts:
         Example:
             composio.connected_accounts.refresh("ca_abc123")
         """
-        warnings.warn(
-            _REFRESH_DEPRECATION, exceptions.ComposioDeprecationWarning, stacklevel=2
+        return self._client.connected_accounts.refresh(
+            nanoid, **_refresh_params(params)
         )
-        # The API no longer accepts validate_credentials; forward every other
-        # kwarg (timeout, extra_headers, ...) unchanged.
-        forwarded: t.Dict[str, t.Any] = dict(params)
-        if forwarded.pop("validate_credentials", None) is not None:
-            warnings.warn(
-                _REFRESH_VALIDATE_CREDENTIALS_IGNORED,
-                exceptions.ComposioDeprecationWarning,
-                stacklevel=2,
-            )
-        return self._client.connected_accounts.refresh(nanoid, **forwarded)
 
     def revoke(
         self, nanoid: str
@@ -494,15 +641,8 @@ class ConnectedAccounts:
         """
         try:
             return self._client.connected_accounts.revoke(nanoid)
-        except BadRequestError as error:
-            raise exceptions.ComposioConnectedAccountRevocationNotSupportedError(
-                f"Connected account {nanoid!r} cannot be revoked programmatically: "
-                f"the toolkit does not support token revocation ({error})"
-            ) from error
-        except ConflictError as error:
-            raise exceptions.ComposioConnectedAccountNotRevokableError(
-                f"Connected account {nanoid!r} is not in a revokable state ({error})"
-            ) from error
+        except (BadRequestError, ConflictError) as error:
+            raise _revoke_error(nanoid, error) from error
 
     def complete_auth(
         self, *, user_id: str, session_uri: str
@@ -597,38 +737,15 @@ class ConnectedAccounts:
                 not_allowed_user_ids=['user_bob'],
             )
         """
-        if (
-            allow_all_users is None
-            and allowed_user_ids is None
-            and not_allowed_user_ids is None
-        ):
-            raise exceptions.ValidationError(
-                "update_acl requires at least one of allow_all_users, "
-                "allowed_user_ids, or not_allowed_user_ids"
-            )
-
-        acl: t.Dict[str, t.Any] = {}
-        if allow_all_users is not None:
-            acl["allow_all_users"] = allow_all_users
-        if allowed_user_ids is not None:
-            acl["allowed_user_ids"] = allowed_user_ids
-        if not_allowed_user_ids is not None:
-            acl["not_allowed_user_ids"] = not_allowed_user_ids
-
+        experimental = _acl_payload(
+            allow_all_users, allowed_user_ids, not_allowed_user_ids
+        )
         try:
             return self._client.connected_accounts.patch(
-                nanoid,
-                experimental={
-                    "acl_config_for_shared": t.cast(
-                        connected_account_patch_params.ExperimentalACLConfigForShared,
-                        acl,
-                    ),
-                },
+                nanoid, experimental=experimental
             )
         except BadRequestError as error:
-            message = str(error)
-            if ACL_ONLY_FOR_SHARED_ERROR_FRAGMENT in message:
-                raise exceptions.ComposioAclOnlyForSharedError(message) from error
+            _raise_acl_only_for_shared(error)
             raise
 
     def initiate(
@@ -679,25 +796,14 @@ class ConnectedAccounts:
         connected_accounts = self.list(
             user_ids=[user_id], auth_config_ids=[auth_config_id], statuses=["ACTIVE"]
         )
-        if connected_accounts.items and not allow_multiple:
-            raise exceptions.ComposioMultipleConnectedAccountsError(
-                f"Multiple connected accounts found for user {user_id} in auth config {auth_config_id}. "
-                "Please use the allow_multiple option to allow multiple connected accounts."
-            )
-        elif connected_accounts.items:
-            logger.warning(
-                "[Warn:AllowMultiple] Multiple connected accounts found for user %s in auth config %s",
-                user_id,
-                auth_config_id,
-            )
+        _guard_multiple_accounts(
+            connected_accounts.items,
+            user_id=user_id,
+            auth_config_id=auth_config_id,
+            allow_multiple=allow_multiple,
+        )
 
-        connection: dict[str, t.Any] = {"user_id": user_id}
-        if callback_url is not None:
-            connection["callback_url"] = callback_url
-        if config is not None:
-            connection["state"] = config
-        if alias is not None:
-            connection["alias"] = alias
+        connection = _initiate_connection(user_id, callback_url, config, alias)
 
         # Use `with_raw_response.create` so we can read the SEC-339
         # `Deprecation` header (RFC 9745) the apollo retiring branch sets —
@@ -715,59 +821,23 @@ class ConnectedAccounts:
             if callable(raw_create):
                 raw = raw_create(
                     auth_config={"id": auth_config_id},
-                    connection=t.cast(
-                        connected_account_create_params.Connection, connection
-                    ),
+                    connection=connection,
                 )
                 response = raw.parse() if callable(getattr(raw, "parse", None)) else raw
-                headers = getattr(raw, "headers", None)
-                if headers is not None and hasattr(headers, "get"):
-                    value = headers.get("Deprecation") or headers.get("deprecation")
-                    if isinstance(value, str):
-                        deprecation_header = value
+                deprecation_header = _deprecation_header(raw)
             else:
                 # Test mocks may not stub `with_raw_response`. Fall back to
                 # the parsed-only path; the deprecation gate stays off (no
                 # header to read).
                 response = ca_client.create(
                     auth_config={"id": auth_config_id},
-                    connection=t.cast(
-                        connected_account_create_params.Connection, connection
-                    ),
+                    connection=connection,
                 )
         except BadRequestError as error:
-            # When the server has flipped this org to the retired path, the
-            # legacy endpoint returns 400 with a stable migration message.
-            # Surface it as a typed error so callers get an actionable hint
-            # instead of a generic BadRequestError.
-            message = str(error)
-            if (
-                "no longer supported" in message
-                and "/api/v3/connected_accounts/link" in message
-            ):
-                raise exceptions.ComposioLegacyConnectedAccountsEndpointRetiredError(
-                    message
-                ) from error
+            _raise_legacy_endpoint_retired(error)
             raise
 
-        # Warn once per process when apollo flags this response as on the
-        # retiring path. Header presence is a 1:1 signal — custom auth
-        # configs and non-OAuth schemes get a clean response and stay silent,
-        # fixing the false-positive that auth_scheme-based detection
-        # produced.
-        global _legacy_initiate_warning_emitted
-        if not _legacy_initiate_warning_emitted and deprecation_header:
-            _legacy_initiate_warning_emitted = True
-            warnings.warn(
-                "composio.connected_accounts.initiate() will stop working "
-                "for this auth config on or before 2026-07-03 (see Sunset "
-                "header on the response). Switch to "
-                "composio.connected_accounts.link() — same return shape, "
-                "same allow_multiple semantics. "
-                "https://docs.composio.dev/docs/changelog/2026/04/24",
-                exceptions.ComposioDeprecationWarning,
-                stacklevel=2,
-            )
+        _warn_legacy_initiate(deprecation_header)
 
         return ConnectionRequest(
             id=response.id,
@@ -847,17 +917,12 @@ class ConnectedAccounts:
         connected_accounts = self.list(
             user_ids=[user_id], auth_config_ids=[auth_config_id], statuses=["ACTIVE"]
         )
-        if connected_accounts.items and not allow_multiple:
-            raise exceptions.ComposioMultipleConnectedAccountsError(
-                f"Multiple connected accounts found for user {user_id} in auth config {auth_config_id}. "
-                "Please use the allow_multiple option to allow multiple connected accounts."
-            )
-        elif connected_accounts.items:
-            logger.warning(
-                "[Warn:AllowMultiple] Multiple connected accounts found for user %s in auth config %s",
-                user_id,
-                auth_config_id,
-            )
+        _guard_multiple_accounts(
+            connected_accounts.items,
+            user_id=user_id,
+            auth_config_id=auth_config_id,
+            allow_multiple=allow_multiple,
+        )
 
         try:
             response = self._client.link.create(
@@ -868,12 +933,7 @@ class ConnectedAccounts:
                 experimental=experimental if experimental is not None else omit,
             )
         except BadRequestError as error:
-            # The server rejects ACL on PRIVATE connections — surface that
-            # as a typed error so callers can ``except`` instead of grepping
-            # messages.
-            message = str(error)
-            if ACL_ONLY_FOR_SHARED_ERROR_FRAGMENT in message:
-                raise exceptions.ComposioAclOnlyForSharedError(message) from error
+            _raise_acl_only_for_shared(error)
             raise
 
         return ConnectionRequest(

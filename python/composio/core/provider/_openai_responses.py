@@ -11,7 +11,11 @@ import typing_extensions as te
 from openai.types.responses.response import Response
 from openai.types.responses.response_output_item import ResponseFunctionToolCall
 
-from composio.core.provider import NonAgenticProvider, ToolCallSession
+from composio.core.provider import (
+    AsyncToolCallSession,
+    NonAgenticProvider,
+    ToolCallSession,
+)
 from composio.core.provider.base import BaseProviderConfig
 from composio.types import Modifiers, Tool, ToolExecutionResponse
 from composio.utils.logging import get as get_logger
@@ -152,23 +156,26 @@ class OpenAIResponsesProvider(
             user_id=user_id, session=session
         )
 
+        return self.execute_tool_for_target(
+            target=target,
+            slug=tool_call.name,
+            arguments=self._tool_call_arguments(tool_call),
+            modifiers=modifiers,
+        )
+
+    def _tool_call_arguments(
+        self, tool_call: ResponseFunctionToolCall
+    ) -> dict[str, t.Any]:
         # OpenAI always serializes tool arguments as a JSON string; normalize
         # tolerates empty / object-shaped payloads too (issue #2406).
-        slug = tool_call.name
         arguments = normalize_tool_arguments(tool_call.arguments)
-        strict_schema = self._strict_input_schemas.get(slug)
+        strict_schema = self._strict_input_schemas.get(tool_call.name)
         if strict_schema is not None:
             # Under strict mode optional parameters are emitted as
             # required-nullable, so a ``null`` the tool's own schema does not
             # accept means "omitted".
             arguments = omit_null_tool_arguments(arguments, strict_schema)
-
-        return self.execute_tool_for_target(
-            target=target,
-            slug=slug,
-            arguments=arguments,
-            modifiers=modifiers,
-        )
+        return arguments
 
     @t.overload
     def handle_tool_calls(
@@ -203,6 +210,31 @@ class OpenAIResponsesProvider(
         :param modifiers: Optional modifiers for tool execution
         :return: List[ToolExecutionResponse] with tool execution results
         """
+        outputs = []
+        for item in self._function_calls(response, user_id, session, modifiers):
+            result = (
+                self.execute_tool_call(
+                    session=session,
+                    tool_call=item,
+                )
+                if session is not None
+                else self.execute_tool_call(
+                    user_id=t.cast(str, user_id),
+                    tool_call=item,
+                    modifiers=modifiers,
+                )
+            )
+            outputs.append(result)
+
+        return outputs
+
+    def _function_calls(
+        self,
+        response: Response | None,
+        user_id: str | None,
+        session: t.Any | None,
+        modifiers: Modifiers | None,
+    ) -> list[ResponseFunctionToolCall]:
         if response is None:
             raise TypeError("response is required")
         self.resolve_tool_call_execution_target(user_id=user_id, session=session)
@@ -210,23 +242,48 @@ class OpenAIResponsesProvider(
             raise ValueError(
                 "Direct execution modifiers cannot be used with a Tool Router session"
             )
-        outputs = []
+        return [
+            item
+            for item in response.output or []
+            if isinstance(item, ResponseFunctionToolCall)
+        ]
 
-        if response.output:
-            for item in response.output:
-                if isinstance(item, ResponseFunctionToolCall):
-                    result = (
-                        self.execute_tool_call(
-                            session=session,
-                            tool_call=item,
-                        )
-                        if session is not None
-                        else self.execute_tool_call(
-                            user_id=t.cast(str, user_id),
-                            tool_call=item,
-                            modifiers=modifiers,
-                        )
-                    )
-                    outputs.append(result)
+    async def aexecute_tool_call(
+        self,
+        user_id: str | None = None,
+        tool_call: ResponseFunctionToolCall | None = None,
+        modifiers: Modifiers | None = None,
+        *,
+        session: AsyncToolCallSession | None = None,
+    ) -> ToolExecutionResponse:
+        """See :meth:`execute_tool_call`; for use with ``AsyncComposio``."""
+        if tool_call is None:
+            raise TypeError("tool_call is required")
+        target = self.resolve_tool_call_execution_target(
+            user_id=user_id, session=session
+        )
+        return await self.aexecute_tool_for_target(
+            target=target,
+            slug=tool_call.name,
+            arguments=self._tool_call_arguments(tool_call),
+            modifiers=modifiers,
+        )
 
-        return outputs
+    async def ahandle_tool_calls(
+        self,
+        user_id: str | None = None,
+        response: Response | None = None,
+        modifiers: Modifiers | None = None,
+        *,
+        session: AsyncToolCallSession | None = None,
+    ) -> list[ToolExecutionResponse]:
+        """See :meth:`handle_tool_calls`; for use with ``AsyncComposio``.
+
+        Tool calls run one after another, in the order the model emitted them.
+        """
+        return [
+            await self.aexecute_tool_call(
+                user_id=user_id, tool_call=item, modifiers=modifiers, session=session
+            )
+            for item in self._function_calls(response, user_id, session, modifiers)
+        ]

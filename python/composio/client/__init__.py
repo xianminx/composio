@@ -23,11 +23,15 @@ from composio_client import (
     NotGiven,
     Scope,
 )
+from composio_client import AsyncComposio as AsyncBaseComposio
 from composio_client import Composio as BaseComposio
-from httpx import URL, Client, Response, Timeout
+from httpx import URL, AsyncClient, Client, Response, Timeout
 
 from composio.exceptions import ComposioError
 from composio.utils.logging import LogLevel, WithLogger, _VerbosityWrapper
+from composio.utils.toolkit_deprecation import (
+    install_async_hook as _install_async_toolkit_deprecation_hook,
+)
 from composio.utils.toolkit_deprecation import (
     install_hook as _install_toolkit_deprecation_hook,
 )
@@ -61,7 +65,7 @@ def _client_identity(provider: str) -> ClientIdentity:
         version=_SDK_VERSION,
         source="PYTHON_SDK",
         framework=provider if _HEADER_SAFE.fullmatch(provider) else "unknown",
-        runtime=HttpClient._runtime_env,
+        runtime=_RUNTIME_ENV,
     )
 
 
@@ -333,85 +337,29 @@ class RequestContext(te.TypedDict):
     provider: str
 
 
-# TODO: Rename `Composio` to `HttpClient` in stainless generator
-class HttpClient(BaseComposio, WithLogger):
-    """
-    Wrapper around the auto-generated composio client.
-    """
+_RUNTIME_ENV: str = f"{_detect_runtime_environment()}_{_get_python_implementation()}"
+"""Detected once at import."""
+
+
+class _SDKClientMixin:
+    """What :class:`HttpClient` and :class:`AsyncHttpClient` add to the generated
+    client, apart from ``request``, which one awaits and the other does not."""
 
     request_ctx: contextvars.ContextVar[RequestContext]
     not_given = NOT_GIVEN
+    _runtime_env: str = _RUNTIME_ENV
 
-    # Detect once at class initialization
-    _runtime_env: str = (
-        f"{_detect_runtime_environment()}_{_get_python_implementation()}"
-    )
+    provider: str
+    sdk_auth: Auth
+    _logger: _VerbosityWrapper
 
-    def __init__(
-        self,
-        *,
-        provider: str,
-        auth: Auth,
-        scope: t.Optional[Scope] = None,
-        environment: te.Union[NotGiven, APIEnvironment] = "production",
-        base_url: t.Optional[t.Union[str, URL, NotGiven]] = NOT_GIVEN,
-        timeout: t.Optional[t.Union[float, Timeout, NotGiven]] = NOT_GIVEN,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        default_headers: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
-        identity: t.Optional[ClientIdentity] = None,
-        http_client: t.Optional[Client] = None,
-        logger: t.Optional[logging.Logger] = None,
-        logging_level: t.Optional[LogLevel] = None,
-        _strict_response_validation: bool = False,
-    ) -> None:
-        """
-        Initialize the client.
-
-        :param provider: The provider to use for the client.
-        :param auth: How the client authenticates (``ProjectAuth``, ``UserAuth``,
-            ``AutoAuth``, ...). The client reads no environment variable; the SDK
-            resolves the keys before constructing it.
-        :param scope: The organization and project requests are routed to, sent
-            as ``x-org-id`` / ``x-project-id``.
-        :param logger: Logger that receives SDK and ``composio_client`` records.
-        :param logging_level: Level applied to the SDK and ``composio_client`` loggers.
-        :param environment: The environment to use for the client.
-        :param base_url: The base URL to use for the client.
-        :param timeout: The timeout to use for the client.
-        :param max_retries: The maximum number of retries to use for the client.
-        :param default_headers: The default headers to use for the client. They
-            may not name a credential header while ``auth`` holds a credential, nor
-            a scope header while ``scope`` is set.
-        :param identity: How the client reports the SDK; derived from ``provider``
-            when omitted. Clones pass the parent's.
-        :param http_client: The HTTP client to use for the client.
-        """
-        WithLogger.__init__(self, logger=logger, logging_level=logging_level)
-        BaseComposio.__init__(
-            self,
-            auth=auth,
-            scope=scope,
-            environment=environment,
-            base_url=base_url,
-            timeout=timeout,
-            max_retries=max_retries,
-            default_headers=default_headers,
-            http_client=http_client,
-            identity=identity if identity is not None else _client_identity(provider),
-            _strict_response_validation=_strict_response_validation,
-        )
+    def _init_sdk_state(self, *, provider: str, auth: Auth) -> None:
         # The SDK's own reference to the credentials it authenticated with, for
         # the places that hand a key to something other than this client (the
         # session MCP config, the realtime channel auth). The client reads no
         # key back, and `auth` is the generated `/auth` resource.
         self.sdk_auth: Auth = auth
         _install_client_log_forwarder(self._logger)
-        # Warns once per deprecated toolkit version reported through the
-        # `Composio-Deprecated-Toolkits` response header. The hook lives on the
-        # underlying httpx client, which `copy()` / `with_options()` (and so
-        # `without_retries`) reuse, so clones share it. Idempotent, and a
-        # user-supplied client keeps its own hooks.
-        _install_toolkit_deprecation_hook(self._client)
         self.provider = provider
         self.request_ctx = contextvars.ContextVar[RequestContext](
             "request_ctx",
@@ -476,6 +424,122 @@ class HttpClient(BaseComposio, WithLogger):
             self._without_retries = self.with_options(max_retries=0)
         return self._without_retries
 
+    def _make_status_error(
+        self,
+        err_msg: str,
+        *,
+        body: object,
+        response: Response,
+    ) -> APIStatusError:
+        """
+        Build status errors that are also ``ComposioError``s; see
+        ``_with_sdk_error_base``.
+
+        Every status error the client raises is built through this hook, so
+        overriding it here covers all response paths at once.
+        """
+        return _as_sdk_error(
+            super()._make_status_error(  # type: ignore[misc]
+                err_msg, body=body, response=response
+            )
+        )
+
+    def _headers_for(self, url: str, **kwargs: t.Any) -> t.Dict[str, str]:
+        """
+        Add ``x-request-id`` to every dispatch to the API origin.
+
+        The client builds every other header itself (credential from ``auth``,
+        ``x-org-id`` / ``x-project-id`` from ``scope``, identity from
+        ``identity``) and generates no request id, so this is all the override
+        still does. The client calls it once per logical call (its retries
+        reuse those headers) and again for each redirect hop, so a fresh id is
+        minted per call and per same-origin hop unless the caller pinned one in
+        ``default_headers`` or the request context. The keywords are forwarded
+        untouched so the override does not depend on the client's private
+        signature.
+        """
+        headers: t.Dict[str, str] = super()._headers_for(url, **kwargs)  # type: ignore[misc]
+        target, base = URL(url), URL(t.cast(t.Any, self).base_url)
+        if (target.scheme, target.host, target.port) != (
+            base.scheme,
+            base.host,
+            base.port,
+        ):
+            return headers
+        ctx = self.request_ctx.get()
+        headers["x-request-id"] = (
+            ctx.get("id") or headers.get("x-request-id") or uuid4().hex
+        )
+        return headers
+
+
+# TODO: Rename `Composio` to `HttpClient` in stainless generator
+class HttpClient(_SDKClientMixin, BaseComposio, WithLogger):
+    """
+    Wrapper around the auto-generated composio client.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        auth: Auth,
+        scope: t.Optional[Scope] = None,
+        environment: te.Union[NotGiven, APIEnvironment] = "production",
+        base_url: t.Optional[t.Union[str, URL, NotGiven]] = NOT_GIVEN,
+        timeout: t.Optional[t.Union[float, Timeout, NotGiven]] = NOT_GIVEN,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        default_headers: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
+        identity: t.Optional[ClientIdentity] = None,
+        http_client: t.Optional[Client] = None,
+        logger: t.Optional[logging.Logger] = None,
+        logging_level: t.Optional[LogLevel] = None,
+        _strict_response_validation: bool = False,
+    ) -> None:
+        """
+        Initialize the client.
+
+        :param provider: The provider to use for the client.
+        :param auth: How the client authenticates (``ProjectAuth``, ``UserAuth``,
+            ``AutoAuth``, ...). The client reads no environment variable; the SDK
+            resolves the keys before constructing it.
+        :param scope: The organization and project requests are routed to, sent
+            as ``x-org-id`` / ``x-project-id``.
+        :param logger: Logger that receives SDK and ``composio_client`` records.
+        :param logging_level: Level applied to the SDK and ``composio_client`` loggers.
+        :param environment: The environment to use for the client.
+        :param base_url: The base URL to use for the client.
+        :param timeout: The timeout to use for the client.
+        :param max_retries: The maximum number of retries to use for the client.
+        :param default_headers: The default headers to use for the client. They
+            may not name a credential header while ``auth`` holds a credential, nor
+            a scope header while ``scope`` is set.
+        :param identity: How the client reports the SDK; derived from ``provider``
+            when omitted. Clones pass the parent's.
+        :param http_client: The HTTP client to use for the client.
+        """
+        WithLogger.__init__(self, logger=logger, logging_level=logging_level)
+        BaseComposio.__init__(
+            self,
+            auth=auth,
+            scope=scope,
+            environment=environment,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            default_headers=default_headers,
+            http_client=http_client,
+            identity=identity if identity is not None else _client_identity(provider),
+            _strict_response_validation=_strict_response_validation,
+        )
+        self._init_sdk_state(provider=provider, auth=auth)
+        # Warns once per deprecated toolkit version reported through the
+        # `Composio-Deprecated-Toolkits` response header. The hook lives on the
+        # underlying httpx client, which `copy()` / `with_options()` (and so
+        # `without_retries`) reuse, so clones share it. Idempotent, and a
+        # user-supplied client keeps its own hooks.
+        _install_toolkit_deprecation_hook(self._client)
+
     def request(  # type: ignore[override]
         self,
         cast_to: t.Any,
@@ -494,48 +558,72 @@ class HttpClient(BaseComposio, WithLogger):
         finally:
             _active_log_wrapper.reset(token)
 
-    def _make_status_error(
+
+class AsyncHttpClient(_SDKClientMixin, AsyncBaseComposio, WithLogger):
+    """
+    Wrapper around the auto-generated async composio client.
+
+    The asyncio counterpart of :class:`HttpClient`: same identity, error
+    mapping, request ids and log routing, over ``httpx.AsyncClient``.
+    """
+
+    allow_tracking: t.Optional[bool] = None
+    """Telemetry opt-out for resources on this client; ``None`` defers to the
+    ``allow_tracking`` context variable."""
+
+    def __init__(
         self,
-        err_msg: str,
         *,
-        body: object,
-        response: Response,
-    ) -> APIStatusError:
-        """
-        Build status errors that are also ``ComposioError``s; see
-        ``_with_sdk_error_base``.
-
-        Every status error the client raises is built through this hook, so
-        overriding it here covers all response paths at once.
-        """
-        return _as_sdk_error(
-            super()._make_status_error(err_msg, body=body, response=response)
+        provider: str,
+        auth: Auth,
+        scope: t.Optional[Scope] = None,
+        environment: te.Union[NotGiven, APIEnvironment] = "production",
+        base_url: t.Optional[t.Union[str, URL, NotGiven]] = NOT_GIVEN,
+        timeout: t.Optional[t.Union[float, Timeout, NotGiven]] = NOT_GIVEN,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        default_headers: t.Optional[t.Mapping[str, t.Optional[str]]] = None,
+        identity: t.Optional[ClientIdentity] = None,
+        http_client: t.Optional[AsyncClient] = None,
+        logger: t.Optional[logging.Logger] = None,
+        logging_level: t.Optional[LogLevel] = None,
+        _strict_response_validation: bool = False,
+    ) -> None:
+        """See :class:`HttpClient`; ``http_client`` is an ``httpx.AsyncClient``."""
+        WithLogger.__init__(self, logger=logger, logging_level=logging_level)
+        AsyncBaseComposio.__init__(
+            self,
+            auth=auth,
+            scope=scope,
+            environment=environment,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            default_headers=default_headers,
+            http_client=http_client,
+            identity=identity if identity is not None else _client_identity(provider),
+            _strict_response_validation=_strict_response_validation,
         )
+        self._init_sdk_state(provider=provider, auth=auth)
+        _install_async_toolkit_deprecation_hook(self._client)
 
-    def _headers_for(self, url: str, **kwargs: t.Any) -> t.Dict[str, str]:
-        """
-        Add ``x-request-id`` to every dispatch to the API origin.
+    async def request(  # type: ignore[override]
+        self,
+        cast_to: t.Any,
+        options: t.Mapping[str, t.Any],
+        *,
+        stream: bool = False,
+        stream_cls: t.Optional[t.Type[t.Any]] = None,
+    ) -> t.Any:
+        # See `HttpClient.request`. The context variable is task-local, so
+        # concurrent requests on one loop each reach their own client's logger.
+        token = _active_log_wrapper.set(self._logger)
+        try:
+            return await super().request(
+                cast_to, options, stream=stream, stream_cls=stream_cls
+            )
+        finally:
+            _active_log_wrapper.reset(token)
 
-        The client builds every other header itself (credential from ``auth``,
-        ``x-org-id`` / ``x-project-id`` from ``scope``, identity from
-        ``identity``) and generates no request id, so this is all the override
-        still does. The client calls it once per logical call (its retries
-        reuse those headers) and again for each redirect hop, so a fresh id is
-        minted per call and per same-origin hop unless the caller pinned one in
-        ``default_headers`` or the request context. The keywords are forwarded
-        untouched so the override does not depend on the client's private
-        signature.
-        """
-        headers = super()._headers_for(url, **kwargs)
-        target, base = URL(url), URL(self.base_url)
-        if (target.scheme, target.host, target.port) != (
-            base.scheme,
-            base.host,
-            base.port,
-        ):
-            return headers
-        ctx = self.request_ctx.get()
-        headers["x-request-id"] = (
-            ctx.get("id") or headers.get("x-request-id") or uuid4().hex
-        )
-        return headers
+
+AnyHttpClient = t.Union[HttpClient, AsyncHttpClient]
+"""Either client, for helpers that only read configuration off it."""

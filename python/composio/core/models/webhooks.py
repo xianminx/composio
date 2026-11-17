@@ -176,6 +176,23 @@ def first_webhook_subscription_id(response: object) -> t.Optional[str]:
     return subscription_id
 
 
+def _subscription_events(
+    webhook_url: str, enabled_events: t.Optional[t.Sequence[str]]
+) -> t.List[str]:
+    """Validate ``set`` input and resolve the events to subscribe to."""
+    if not webhook_url:
+        raise exceptions.ValidationError("please provide a valid `webhook_url`")
+
+    events = list(
+        DEFAULT_WEBHOOK_SUBSCRIPTION_EVENTS
+        if enabled_events is None
+        else enabled_events
+    )
+    if len(events) == 0:
+        raise exceptions.ValidationError("please provide at least one enabled event")
+    return events
+
+
 class WebhookSubscriptions(Resource):
     """Manage the project webhook subscription.
 
@@ -243,19 +260,7 @@ class WebhookSubscriptions(Resource):
                 webhook_url=f"{APP_URL}/webhooks/composio",
             )
         """
-        if not webhook_url:
-            raise exceptions.ValidationError("please provide a valid `webhook_url`")
-
-        events = list(
-            DEFAULT_WEBHOOK_SUBSCRIPTION_EVENTS
-            if enabled_events is None
-            else enabled_events
-        )
-        if len(events) == 0:
-            raise exceptions.ValidationError(
-                "please provide at least one enabled event"
-            )
-
+        events = _subscription_events(webhook_url, enabled_events)
         version_value = _webhook_version(version)
 
         existing = self._client.webhook_subscriptions.list(limit=1)

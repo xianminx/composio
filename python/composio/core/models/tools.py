@@ -334,6 +334,180 @@ def tool_execution_response_from_session(
     return result
 
 
+class _SchemaFileHelper(t.Protocol):
+    """The schema half of the file helper, which both twins share."""
+
+    def enhance_schema_descriptions(self, schema: t.Dict) -> t.Dict: ...
+
+    def process_file_uploadable_schema(self, schema: t.Dict) -> t.Dict: ...
+
+
+def _apply_schema_modifiers(
+    tools_list: t.List[Tool], modifiers: t.Optional[Modifiers]
+) -> t.List[Tool]:
+    if modifiers is None:
+        return tools_list
+    return [
+        t.cast(
+            Tool,
+            apply_modifier_by_type(
+                modifiers=modifiers,
+                toolkit=_toolkit_slug(tool, "unknown"),
+                tool=tool.slug,
+                type="schema",
+                schema=tool,
+            ),
+        )
+        for tool in tools_list
+    ]
+
+
+def _cache_tool_schemas(
+    tool_schemas: t.Dict[str, Tool], raw_tools: t.Sequence[Tool]
+) -> t.List[Tool]:
+    """Record ``raw_tools`` in the schema cache and return working copies."""
+    tool_schemas.update({tool.slug: tool.model_copy(deep=True) for tool in raw_tools})
+    return [tool.model_copy(deep=True) for tool in raw_tools]
+
+
+def _prepare_tools_for_provider(
+    raw_tools: t.Sequence[Tool],
+    *,
+    tool_schemas: t.Dict[str, Tool],
+    modifiers: t.Optional[Modifiers],
+    file_helper: _SchemaFileHelper,
+    auto_upload_download_files: bool,
+) -> t.List[Tool]:
+    """Everything ``Tools._get`` does between fetching and wrapping."""
+    tools_list = _apply_schema_modifiers(
+        _cache_tool_schemas(tool_schemas, raw_tools), modifiers
+    )
+
+    # Always enhance schema descriptions (type hints and required notes)
+    # regardless of dangerously_allow_auto_upload_download_files
+    for tool in tools_list:
+        tool.input_parameters = file_helper.enhance_schema_descriptions(
+            schema=tool.input_parameters,
+        )
+
+    # Only process file_uploadable schemas when the caller opted in via
+    # `dangerously_allow_auto_upload_download_files=True`.
+    if auto_upload_download_files:
+        for tool in tools_list:
+            tool.input_parameters = file_helper.process_file_uploadable_schema(
+                schema=tool.input_parameters,
+            )
+    return tools_list
+
+
+def _resolve_execute_version(
+    tool: Tool,
+    version: t.Optional[str],
+    toolkit_versions: t.Optional[ToolkitVersionParam],
+    dangerously_skip_version_check: t.Optional[bool],
+) -> t.Optional[str]:
+    # If version is not explicitly provided, resolve it from instance-level toolkit versions
+    # This matches the TypeScript behavior - always resolve version when None
+    if version is None:
+        toolkit_slug = _toolkit_slug(tool, "unknown")
+        # Use instance-level toolkit versions configuration
+        version = get_toolkit_version(toolkit_slug, toolkit_versions)
+
+    # Check if the version is 'latest' and dangerously_skip_version_check is not True
+    # If so, raise an error to prevent unexpected behavior
+    if version == "latest" and not dangerously_skip_version_check:
+        raise ToolVersionRequiredError()
+    return version
+
+
+class _ExecuteCall(t.NamedTuple):
+    """The parameters of one ``execute`` call that modifiers may rewrite."""
+
+    arguments: t.Dict
+    connected_account_id: t.Optional[str]
+    custom_auth_params: t.Optional[tool_execute_params.CustomAuthParams]
+    custom_connection_data: t.Optional[tool_execute_params.CustomConnectionData]
+    user_id: t.Optional[str]
+    text: t.Optional[str]
+    version: t.Optional[str]
+    dangerously_skip_version_check: t.Optional[bool]
+
+
+def _apply_before_execute(
+    modifiers: Modifiers, tool: Tool, slug: str, call: _ExecuteCall
+) -> _ExecuteCall:
+    """``call`` after the ``before_execute`` modifiers.
+
+    Modifiers see ``arguments`` plus every parameter the caller set; a key
+    they leave out keeps the caller's value.
+    """
+    request_params = t.cast(
+        ToolExecuteParams,
+        {
+            key: value
+            for key, value in call._asdict().items()
+            if key == "arguments" or value is not None
+        },
+    )
+    processed_params = apply_modifier_by_type(
+        modifiers=modifiers,
+        toolkit=_toolkit_slug(tool, "unknown"),
+        tool=slug,
+        type="before_execute",
+        request=request_params,
+    )
+    return call._replace(
+        **{
+            key: processed_params[key]  # type: ignore[literal-required]
+            for key in call._fields
+            if key in processed_params
+        }
+    )._replace(arguments=processed_params["arguments"])
+
+
+def _session_before_execute(
+    modifiers: t.Optional[Modifiers],
+    toolkit_slug: str,
+    slug: str,
+    arguments: t.Dict,
+) -> t.Dict:
+    """Session-tool arguments after ``before_execute`` modifiers, serialized."""
+    processed_arguments = arguments
+    if modifiers is not None:
+        params: ToolExecuteParams = {
+            "arguments": arguments,
+        }
+        modified_params = apply_modifier_by_type(
+            modifiers=modifiers,
+            toolkit=toolkit_slug,
+            tool=slug,
+            type="before_execute",
+            request=params,
+        )
+        processed_arguments = modified_params.get("arguments", arguments)
+
+    # Serialize any Pydantic model instances before sending to the API
+    return _serialize_arguments(processed_arguments)
+
+
+def _session_after_execute(
+    modifiers: t.Optional[Modifiers],
+    toolkit_slug: str,
+    slug: str,
+    response: ToolRouterSessionExecuteResponse,
+) -> t.Dict:
+    result = tool_execution_response_from_session(response)
+    if modifiers is not None:
+        result = apply_modifier_by_type(
+            modifiers=modifiers,
+            toolkit=toolkit_slug,
+            tool=slug,
+            type="after_execute",
+            response=result,
+        )
+    return t.cast(t.Dict, result)
+
+
 class Tools(Resource, t.Generic[TTool, TToolCollection]):
     """
     Tools class definition
@@ -530,31 +704,9 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
             if not cursor:
                 break
 
-        self._tool_schemas.update(
-            {tool.slug: tool.model_copy(deep=True) for tool in tools_list}
+        return _apply_schema_modifiers(
+            _cache_tool_schemas(self._tool_schemas, tools_list), modifiers
         )
-
-        tools_list = [tool.model_copy(deep=True) for tool in tools_list]
-
-        # Apply schema modifiers if provided
-        if modifiers is not None:
-            from composio.core.models._modifiers import apply_modifier_by_type
-
-            tools_list = [
-                t.cast(
-                    Tool,
-                    apply_modifier_by_type(
-                        modifiers=modifiers,
-                        toolkit=_toolkit_slug(tool, "unknown"),
-                        tool=tool.slug,
-                        type="schema",
-                        schema=tool,
-                    ),
-                )
-                for tool in tools_list
-            ]
-
-        return tools_list
 
     def _get(
         self,
@@ -574,39 +726,13 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
             scopes=scopes,
             limit=limit,
         )
-        self._tool_schemas.update(
-            {tool.slug: tool.model_copy(deep=True) for tool in raw_tools}
+        tools_list = _prepare_tools_for_provider(
+            raw_tools,
+            tool_schemas=self._tool_schemas,
+            modifiers=modifiers,
+            file_helper=self._file_helper,
+            auto_upload_download_files=self._auto_upload_download_files,
         )
-
-        tools_list = [tool.model_copy(deep=True) for tool in raw_tools]
-        if modifiers is not None:
-            tools_list = [
-                apply_modifier_by_type(
-                    modifiers=modifiers,
-                    toolkit=_toolkit_slug(tool, "unknown"),
-                    tool=tool.slug,
-                    type="schema",
-                    schema=tool,
-                )
-                for tool in tools_list
-            ]
-
-        # Always enhance schema descriptions (type hints and required notes)
-        # regardless of dangerously_allow_auto_upload_download_files
-        for tool in tools_list:
-            tool.input_parameters = self._file_helper.enhance_schema_descriptions(
-                schema=tool.input_parameters,
-            )
-
-        # Only process file_uploadable schemas when the caller opted in via
-        # `dangerously_allow_auto_upload_download_files=True`.
-        if self._auto_upload_download_files:
-            for tool in tools_list:
-                tool.input_parameters = (
-                    self._file_helper.process_file_uploadable_schema(
-                        schema=tool.input_parameters,
-                    )
-                )
 
         if issubclass(type(self.provider), NonAgenticProvider):
             return t.cast(
@@ -751,24 +877,9 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
 
             toolkit_slug = _toolkit_slug(tool, "composio")
 
-            # Apply before_execute modifiers
-            processed_arguments = arguments
-            if modifiers is not None:
-                params: ToolExecuteParams = {
-                    "arguments": arguments,
-                }
-                type_before: t.Literal["before_execute"] = "before_execute"
-                modified_params = apply_modifier_by_type(
-                    modifiers=modifiers,
-                    toolkit=toolkit_slug,
-                    tool=slug,
-                    type=type_before,
-                    request=params,
-                )
-                processed_arguments = modified_params.get("arguments", arguments)
-
-            # Serialize any Pydantic model instances before sending to the API
-            processed_arguments = _serialize_arguments(processed_arguments)
+            processed_arguments = _session_before_execute(
+                modifiers, toolkit_slug, slug, arguments
+            )
 
             # Disable retries: a session execution is a non-idempotent write, and a
             # silent retry after a read timeout can duplicate the side effect.
@@ -787,20 +898,7 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
                 slug,
             )
 
-            result = tool_execution_response_from_session(response)
-
-            # Apply after_execute modifiers
-            if modifiers is not None:
-                type_after: t.Literal["after_execute"] = "after_execute"
-                result = apply_modifier_by_type(
-                    modifiers=modifiers,
-                    toolkit=toolkit_slug,
-                    tool=slug,
-                    type=type_after,
-                    response=result,
-                )
-
-            return t.cast(t.Dict, result)
+            return _session_after_execute(modifiers, toolkit_slug, slug, response)
 
         return t.cast(AgenticProviderExecuteFn, execute_tool_fn)
 
@@ -824,17 +922,9 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
         # before sending to the API (fixes PLEN-1514: RootModel not JSON serializable)
         arguments = _serialize_arguments(arguments)
 
-        # If version is not explicitly provided, resolve it from instance-level toolkit versions
-        # This matches the TypeScript behavior - always resolve version when None
-        if version is None:
-            toolkit_slug = _toolkit_slug(tool, "unknown")
-            # Use instance-level toolkit versions configuration
-            version = get_toolkit_version(toolkit_slug, self._toolkit_versions)
-
-        # Check if the version is 'latest' and dangerously_skip_version_check is not True
-        # If so, raise an error to prevent unexpected behavior
-        if version == "latest" and not dangerously_skip_version_check:
-            raise ToolVersionRequiredError()
+        version = _resolve_execute_version(
+            tool, version, self._toolkit_versions, dangerously_skip_version_check
+        )
 
         return t.cast(
             ToolExecutionResponse,
@@ -919,48 +1009,29 @@ class Tools(Resource, t.Generic[TTool, TToolCollection]):
             )
 
         if modifiers is not None:
-            type_before_exec: t.Literal["before_execute"] = "before_execute"
-            request_params: ToolExecuteParams = {
-                "arguments": arguments,
-            }
-            if connected_account_id is not None:
-                request_params["connected_account_id"] = connected_account_id
-            if custom_auth_params is not None:
-                request_params["custom_auth_params"] = custom_auth_params
-            if custom_connection_data is not None:
-                request_params["custom_connection_data"] = custom_connection_data
-            if version is not None:
-                request_params["version"] = version
-            if text is not None:
-                request_params["text"] = text
-            if user_id is not None:
-                request_params["user_id"] = user_id
-            if dangerously_skip_version_check is not None:
-                request_params["dangerously_skip_version_check"] = (
-                    dangerously_skip_version_check
-                )
-            processed_params = apply_modifier_by_type(
-                modifiers=modifiers,
-                toolkit=_toolkit_slug(tool, "unknown"),
-                tool=slug,
-                type=type_before_exec,
-                request=request_params,
-            )
-            connected_account_id = processed_params.get(
-                "connected_account_id", connected_account_id
-            )
-            custom_auth_params = processed_params.get(
-                "custom_auth_params", custom_auth_params
-            )
-            custom_connection_data = processed_params.get(
-                "custom_connection_data", custom_connection_data
-            )
-            text = processed_params.get("text", text)
-            version = processed_params.get("version", version)
-            user_id = processed_params.get("user_id", user_id)
-            arguments = processed_params["arguments"]
-            dangerously_skip_version_check = processed_params.get(
-                "dangerously_skip_version_check", dangerously_skip_version_check
+            (
+                arguments,
+                connected_account_id,
+                custom_auth_params,
+                custom_connection_data,
+                user_id,
+                text,
+                version,
+                dangerously_skip_version_check,
+            ) = _apply_before_execute(
+                modifiers,
+                tool,
+                slug,
+                _ExecuteCall(
+                    arguments=arguments,
+                    connected_account_id=connected_account_id,
+                    custom_auth_params=custom_auth_params,
+                    custom_connection_data=custom_connection_data,
+                    user_id=user_id,
+                    text=text,
+                    version=version,
+                    dangerously_skip_version_check=dangerously_skip_version_check,
+                ),
             )
         response = self._execute_tool(
             slug=slug,

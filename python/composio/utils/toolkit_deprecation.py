@@ -306,6 +306,21 @@ def install_hook(client: httpx.Client) -> None:
     client.event_hooks = {**hooks, "response": response_hooks}
 
 
+async def async_response_hook(response: httpx.Response) -> None:
+    """:func:`response_hook` for ``httpx.AsyncClient``, whose hooks are awaited."""
+    response_hook(response)
+
+
+def install_async_hook(client: httpx.AsyncClient) -> None:
+    """:func:`install_hook` for an ``httpx.AsyncClient``."""
+    hooks = client.event_hooks
+    response_hooks = list(hooks.get("response", []))
+    if any(hook is async_response_hook for hook in response_hooks):
+        return
+    response_hooks.append(async_response_hook)
+    client.event_hooks = {**hooks, "response": response_hooks}
+
+
 def _reset_for_tests() -> None:
     """Clear the once-per-process record. Tests only."""
     with _lock:
